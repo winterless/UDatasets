@@ -1,0 +1,17 @@
+{
+  "dataset": {
+    "name": "agent-data-collection"
+  },
+  "sources": [
+    {
+      "type": "jsonl",
+      "data_dir": "agent-data-collection",
+      "glob": "**/*.jsonl"
+    }
+  ],
+  "adapter": {
+    "kind": "agent-data-collection"
+  }
+}
+
+

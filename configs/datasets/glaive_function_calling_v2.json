@@ -1,0 +1,17 @@
+{
+  "dataset": {
+    "name": "glaive-function-calling-v2"
+  },
+  "sources": [
+    {
+      "type": "json_array",
+      "data_dir": "glaive-function-calling-v2/glaive-function-calling-v2",
+      "glob": "glaive-function-calling-v2.json"
+    }
+  ],
+  "adapter": {
+    "kind": "glaive"
+  }
+}
+
+

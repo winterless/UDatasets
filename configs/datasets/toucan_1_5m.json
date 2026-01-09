@@ -1,0 +1,15 @@
+{
+  "dataset": {
+    "name": "Toucan-1.5M"
+  },
+  "sources": [
+    {
+      "type": "parquet",
+      "data_dir": "Toucan-1.5M/Toucan-1.5M/",
+      "glob": "**/*.parquet"
+    }
+  ],
+  "adapter": {
+    "kind": "toucan"
+  }
+}

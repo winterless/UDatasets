@@ -1,0 +1,17 @@
+{
+  "dataset": {
+    "name": "Hephaestus-Forge"
+  },
+  "sources": [
+    {
+      "type": "json_array",
+      "data_dir": "Hephaestus-Forge",
+      "glob": "*.json"
+    }
+  ],
+  "adapter": {
+    "kind": "hephaestus"
+  }
+}
+
+

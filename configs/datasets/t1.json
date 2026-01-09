@@ -1,0 +1,17 @@
+{
+  "dataset": {
+    "name": "T1"
+  },
+  "sources": [
+    {
+      "type": "csv",
+      "data_dir": "T1",
+      "glob": "**/*.csv"
+    }
+  ],
+  "adapter": {
+    "kind": "t1"
+  }
+}
+
+
