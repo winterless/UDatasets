@@ -285,7 +285,9 @@ def run_pipeline(
     only: str = "",
     compression: str | None = None,
     prepare: bool = False,
+    prepare_only: bool = False,
     token_budget: int | None = None,
+    token_budget_parallel: bool = False,
     seed: int = 42,
     chars_per_token: float = 4.0,
 ) -> int:
@@ -396,8 +398,10 @@ def run_pipeline(
         elif "tasks" in exec_cfg:
             tasks = int(exec_cfg.get("tasks", 20))
         else:
-            # Token-budget sampling is easiest to reason about with a single task (global budget).
-            if token_budget:
+            # Default parallelism:
+            # - If token_budget is set, default is tasks=1 for the closest-to-true global budget.
+            # - If token_budget_parallel is enabled, we allow parallel tasks (budget will be split across tasks).
+            if token_budget and not token_budget_parallel:
                 tasks = 1
             else:
                 # If input is small, don't bother splitting into multiple ranks/tasks.
@@ -415,17 +419,24 @@ def run_pipeline(
         output_filename = "${rank}.jsonl" if not compression else "${rank}.jsonl.gz"
         pipeline = [reader]
         if token_budget:
-            pipeline.append(TokenBudgetLimiter(token_budget, seed=seed, chars_per_token=chars_per_token))
+            # NOTE: TokenBudgetLimiter is per-rank. We treat `token_budget` as a desired *global* budget.
+            # - tasks=1: closest to a true global budget
+            # - tasks>1: approximate by splitting the budget across tasks (may still slightly overshoot)
+            per_rank_budget = int(token_budget)
+            if tasks > 1:
+                per_rank_budget = max(1, (int(token_budget) + tasks - 1) // tasks)
+            pipeline.append(TokenBudgetLimiter(per_rank_budget, seed=seed, chars_per_token=chars_per_token))
 
         # Main output: full Document dict (includes metadata/raw)
-        pipeline.append(
-            StdJsonlWriter(
-                str(ds_out),
-                output_filename=output_filename,
-                compression=compression,
-                max_file_size=writer_max_file_size,
+        if not prepare_only:
+            pipeline.append(
+                StdJsonlWriter(
+                    str(ds_out),
+                    output_filename=output_filename,
+                    compression=compression,
+                    max_file_size=writer_max_file_size,
+                )
             )
-        )
 
         # Prepare output: CPT-friendly lightweight view (uuid + text only)
         if prepare:
@@ -446,7 +457,14 @@ def run_pipeline(
             )
 
         glob_desc = pattern if pattern else (";".join(globs_for_stats) if globs_for_stats else "")
-        print(f"[run] {name} source={source['type']} dir={source['data_dir']} glob={glob_desc}", file=sys.stderr)
+        tb = f"{token_budget}" if token_budget else "0"
+        tb_mode = "split" if (token_budget and tasks > 1) else ("global" if token_budget else "off")
+        out_mode = "prepare-only" if prepare_only else ("prepare+full" if prepare else "full")
+        print(
+            f"[run] {name} source={source['type']} dir={source['data_dir']} glob={glob_desc} "
+            f"tasks={tasks} workers={workers} token_budget={tb}({tb_mode}) out={out_mode}",
+            file=sys.stderr,
+        )
         LocalPipelineExecutor(pipeline=pipeline, logging_dir=str(logs_dir), tasks=tasks, workers=workers).run()
         print(f"[ok] {name} -> {ds_out}", file=sys.stderr)
 

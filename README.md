@@ -20,7 +20,7 @@
 1) 进入仓库根目录：
 
 ```bash
-cd /home/unlimitediw/workspace/TYDeepResearch/UData
+cd /home/unlimitediw/workspace/TYDeepResearch/UDatasets
 ```
 
 2) 安装本地 datatrove（不改源码，只安装依赖）：
@@ -42,12 +42,15 @@ PYTHONPATH=src python -m cli.runner \
   --datasets-root /home/unlimitediw/workspace/datasets \
   --config-dir configs/datasets \
   --out-root out \
-  --prepare \
+  --prepare-only \
   -B 1 \
-  --workers 32
+  --token-budget-parallel \
+  -j 20
 ```
 
-输出示例：`out/datatrove_documents/<dataset_name>/00000.jsonl.gz`（每行一个 Document 字典）。
+输出示例：
+- 完整 Document：`<out-root>/<dataset_name>/00000.jsonl`（每行一个 Document 字典；包含 metadata/raw）
+- 训练用 prepare：`<out-root>/prepare/<dataset_name>/00000.jsonl`（每行仅 uuid+text）
 
 默认不压缩输出（`00000.jsonl`）。如需 gzip 压缩，传 `--compression gzip`，则输出为 `00000.jsonl.gz`。
 
@@ -60,7 +63,13 @@ PYTHONPATH=src python -m cli.runner \
 - `uuid`: 等价于 datatrove 的 `id`
 - `text`: 训练文本
 
-示例：`out/prepare/Toucan-1.5M/000_00000.jsonl`
+示例：`out/prepare/Toucan-1.5M/00000.jsonl`
+
+如果你只需要训练用的 prepare 输出、并且不想额外写一份“完整 Document”（更慢、占更多磁盘），可以用：
+
+```bash
+PYTHONPATH=src python -m cli.runner ... --prepare-only
+```
 
 ### 按 token 预算抽样输出（-B）
 
@@ -73,7 +82,17 @@ PYTHONPATH=src python -m cli.runner \
  - token 数估算是近似：默认大致按 `len(text) / 4` 换算，不追求特别精确（可用 `--chars-per-token` 调整）
 - 输出体积（GB）会明显大于“纯 text”的估算，因为 prepare 是 JSONL（包含 uuid/key/引号/转义等开销）
 - 达到预算后会提前停止；如果数据不足则输出最大可用数据
-- 未显式指定 `--tasks` 且 config 也未指定 `executor.tasks` 时，会自动用 `tasks=1` 来保证预算是全局生效
+- `TokenBudgetLimiter` 是 **按 task(rank) 生效** 的：tasks=1 时最接近“全局预算”；tasks>1 时会把预算按 tasks **均分**，属于“近似全局预算”
+
+如果你希望在 `-B` 预算模式下也并行跑（更快，但预算是“近似全局”），可以加：
+
+```bash
+PYTHONPATH=src python -m cli.runner ... -B 1 --token-budget-parallel -j 20
+```
+
+并行参数小结：
+- `-j/--parallelism N`：同时设置 `--tasks N` 和 `--workers N`（推荐日常使用）
+- `--tasks/--workers`：高级用法，分别控制输出分片数量（tasks）和同时并发数（workers）
 
 如需校准体量，可用 `--chars-per-token` 调整粗略换算（例如中文/代码类文本可能更接近 2–3 chars/token）：
 
@@ -83,6 +102,8 @@ PYTHONPATH=src python -m cli.runner ... -B 1 --chars-per-token 2.5
 
 ### 并行参数（tasks/workers）的默认策略
 
+推荐日常用 `-j/--parallelism N`（同时设置 tasks/workers）。
+
 如果命令行未指定 `--tasks/--workers`，会尝试从每个数据集配置里读取：
 
 ```json
@@ -91,7 +112,7 @@ PYTHONPATH=src python -m cli.runner ... -B 1 --chars-per-token 2.5
 }
 ```
 
-优先级：**CLI 显式传参 > config.executor > 兜底默认值（tasks=20, workers=8）**。
+优先级：**CLI 显式传参（`-j`/`--tasks`/`--workers`）> config.executor > 兜底默认值（tasks=20, workers=8）**。
 
 补充：如果 **CLI 未传 `--tasks` 且 config 里也没写 `executor.tasks`**：
 - 并行 tasks 会取一个保守默认值（不超过输入文件数，避免大量空 `000xx.jsonl`）

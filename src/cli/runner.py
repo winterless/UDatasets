@@ -16,6 +16,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--config-dir", default="configs/datasets")
     ap.add_argument("--out-root", default="out/datatrove_documents")
     ap.add_argument(
+        "-j",
+        "--parallelism",
+        type=int,
+        default=None,
+        help="Convenience flag to set both --tasks and --workers to the same value. "
+        "You can still override them individually with --tasks/--workers.",
+    )
+    ap.add_argument(
         "--tasks",
         type=int,
         default=None,
@@ -37,6 +45,12 @@ def main(argv: list[str] | None = None) -> int:
         help="Sample output to approximately B billion tokens (estimated from text length). 0 disables.",
     )
     ap.add_argument(
+        "--token-budget-parallel",
+        action="store_true",
+        help="Allow parallel tasks even when -B/--token-billions is set by splitting the token budget across tasks "
+        "(approximate global budget). Default behavior forces tasks=1 for a true global budget.",
+    )
+    ap.add_argument(
         "--seed",
         type=int,
         default=42,
@@ -54,12 +68,24 @@ def main(argv: list[str] | None = None) -> int:
         help="Also write a CPT-friendly view under <out-root>/prepare/<dataset>/ with JSONL lines containing only {uuid,text}.",
     )
     ap.add_argument(
+        "--prepare-only",
+        action="store_true",
+        help="Only write the CPT-friendly prepare output (uuid+text) and skip the full Document output. Implies --prepare.",
+    )
+    ap.add_argument(
         "--compression",
         default="none",
         choices=["gzip", "none"],
         help="Output compression. Default: none (plain .jsonl). Use 'gzip' to write .jsonl.gz.",
     )
     args = ap.parse_args(argv)
+
+    if args.parallelism is not None:
+        # Default to setting both when not explicitly set.
+        if args.tasks is None:
+            args.tasks = int(args.parallelism)
+        if args.workers is None:
+            args.workers = int(args.parallelism)
 
     # Import lazily so `--help` works even if datatrove isn't importable yet.
     from integrations.datatrove_backend import run_pipeline
@@ -73,8 +99,10 @@ def main(argv: list[str] | None = None) -> int:
         limit=args.limit,
         only=args.only,
         compression=(None if args.compression == "none" else args.compression),
-        prepare=bool(args.prepare),
+        prepare=bool(args.prepare or args.prepare_only),
+        prepare_only=bool(args.prepare_only),
         token_budget=int(args.token_billions * 1_000_000_000) if args.token_billions else None,
+        token_budget_parallel=bool(args.token_budget_parallel),
         seed=int(args.seed),
         chars_per_token=float(args.chars_per_token),
     )
