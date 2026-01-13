@@ -48,7 +48,7 @@ ensure_datatrove_importable()
 from datatrove.executor import LocalPipelineExecutor  # noqa: E402  # type: ignore[import-not-found]
 from datatrove.io import DataFileLike, DataFolderLike  # noqa: E402  # type: ignore[import-not-found]
 from datatrove.pipeline.readers import CSVReader as CsvReader  # noqa: E402  # type: ignore[import-not-found]
-from datatrove.pipeline.readers import JsonlReader, ParquetReader  # noqa: E402  # type: ignore[import-not-found]
+from datatrove.pipeline.readers import ParquetReader  # noqa: E402  # type: ignore[import-not-found]
 from datatrove.pipeline.readers.base import BaseDiskReader  # noqa: E402  # type: ignore[import-not-found]
 from datatrove.pipeline.writers.disk_base import DiskWriter  # noqa: E402  # type: ignore[import-not-found]
 from datatrove.pipeline.base import PipelineStep  # noqa: E402  # type: ignore[import-not-found]
@@ -211,6 +211,103 @@ class JsonArrayReader(BaseDiskReader):
 
 
 # -------------------------
+# Extra reader: jsonl (safe)
+# -------------------------
+class SafeJsonlReader(BaseDiskReader):
+    """
+    A safer JSONL reader than datatrove's built-in JsonlReader for messy corpora.
+
+    Why:
+    - Some datasets contain blank lines, "null" lines, or partially-written/corrupted JSON.
+    - Older datatrove JsonlReader paths may assume each parsed line is a dict and do `line.get(...)`,
+      which crashes when json.loads(line) returns None.
+
+    Behavior:
+    - Skip blank lines, `null` lines, and invalid JSON lines (log warning).
+    - If a JSON line parses but is not a dict (e.g. list/str/number), wrap it as {"value": ...}.
+    """
+
+    name = "🐿 SafeJsonl"
+
+    def __init__(
+        self,
+        data_folder: DataFolderLike,
+        paths_file: DataFileLike | None = None,
+        compression: Literal["infer", "gzip", "zstd"] | None = "infer",
+        limit: int = -1,
+        skip: int = 0,
+        file_progress: bool = False,
+        doc_progress: bool = False,
+        adapter: Callable = None,
+        text_key: str = "text",
+        id_key: str = "id",
+        default_metadata: dict = None,
+        recursive: bool = True,
+        glob_pattern: str | None = None,
+        shuffle_files: bool = False,
+    ):
+        super().__init__(
+            data_folder,
+            paths_file,
+            limit,
+            skip,
+            file_progress,
+            doc_progress,
+            adapter,
+            text_key,
+            id_key,
+            default_metadata,
+            recursive,
+            glob_pattern,
+            shuffle_files,
+        )
+        self.compression = compression
+
+    def read_file(self, filepath: str):
+        bad_json = 0
+        null_lines = 0
+        with self.data_folder.open(filepath, "r", compression=self.compression) as f:
+            try:
+                head = f.read(200)
+                if head.startswith("version https://git-lfs.github.com/spec/v1"):
+                    logger.warning(
+                        f"Skipping `{filepath}`: looks like a Git LFS pointer file (run `git lfs pull` to fetch real content)."
+                    )
+                    return
+                try:
+                    f.seek(0)
+                except Exception:
+                    pass
+
+                for li, raw_line in enumerate(f):
+                    s = raw_line.strip()
+                    if not s:
+                        continue
+                    try:
+                        obj = json.loads(s)
+                    except (ValueError, json.JSONDecodeError):
+                        bad_json += 1
+                        continue
+                    if obj is None:
+                        null_lines += 1
+                        continue
+                    if not isinstance(obj, dict):
+                        obj = {"value": obj}
+                    with self.track_time():
+                        document = self.get_document_from_dict(obj, filepath, li)
+                        if not document:
+                            continue
+                    yield document
+            except UnicodeDecodeError as e:
+                logger.warning(f"File `{filepath}` may be corrupted: raised UnicodeDecodeError ({e})")
+            finally:
+                if bad_json:
+                    logger.warning(f"In `{filepath}`: skipped {bad_json} invalid JSONL lines")
+                if null_lines:
+                    logger.warning(f"In `{filepath}`: skipped {null_lines} `null` JSONL lines")
+
+
+# -------------------------
 # Adapters: record -> Document
 # -------------------------
 
@@ -236,7 +333,7 @@ def build_reader(source: dict, datasets_root: Path, adapter_fn: Callable, *, pat
     glob = source.get("glob") or ""
     shuffle_files = bool(source.get("_shuffle_files", False))
     if stype == "jsonl":
-        return JsonlReader(
+        return SafeJsonlReader(
             str(base),
             paths_file=paths_file,
             glob_pattern=(glob or None),
