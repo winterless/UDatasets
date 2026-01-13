@@ -104,22 +104,11 @@ def hephaestus_adapter(self, data: JsonDict, path: str, id_in_file: int | str) -
     return {"text": _ensure_text(text), "id": doc_id, "metadata": {"dataset": "Hephaestus-Forge", "raw": raw}}
 
 
-def t1_csv_adapter(self, data: JsonDict, path: str, id_in_file: int | str) -> JsonDict:
-    raw = dict(data)
-    row_id = raw.get("ID") or raw.get("Id") or raw.get("id")
-    doc_id = str(row_id).strip() if row_id is not None and str(row_id).strip() else _stable_id_from_path(path, id_in_file)
-    ft = raw.get("Filled_Template") or raw.get("Template") or ""
-    fp = raw.get("Filled_Plan") or raw.get("Plan") or ""
-    text = f"{ft}\n{fp}".strip()
-    return {"text": _ensure_text(text), "id": doc_id, "metadata": {"dataset": "T1", "raw": raw, "file": path}}
-
-
 BASE_ADAPTERS: dict[str, Callable] = {
     "toucan": toucan_adapter,
     "agent-data-collection": agent_data_collection_adapter,
     "glaive": glaive_adapter,
     "hephaestus": hephaestus_adapter,
-    "t1": t1_csv_adapter,
 }
 
 

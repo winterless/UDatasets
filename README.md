@@ -10,7 +10,7 @@
 
 ## 统一入口：Datatrove 驱动（输出标准 Document：text/id/metadata.raw）
 
-目标：对多套数据（Toucan/agent-data-collection/glaive/Hephaestus/T1）生成 datatrove `Document`：
+目标：对多套数据（Toucan/agent-data-collection/glaive/Hephaestus）生成 datatrove `Document`：
 - `text`: 可训练文本视图
 - `id`: 优先使用样本自带 id/uuid，否则用 `path/row_index`
 - `metadata.raw`: **原始 record 全量保留**（非 text 字段都在这里）
@@ -29,12 +29,11 @@ cd /home/unlimitediw/workspace/TYDeepResearch/UData
 python -m pip install -e "/home/unlimitediw/workspace/datatrove[io]"
 ```
 
-3) 准备配置（每数据集一个 JSON，放在 `configs/datasets/`，已提供 5 个示例）：
+3) 准备配置（每数据集一个 JSON，放在 `configs/datasets/`，已提供 4 个示例）：
 - `configs/datasets/toucan_1_5m.json`（parquet/jsonl 二选一，优先 parquet）
 - `configs/datasets/agent_data_collection.json`
 - `configs/datasets/glaive_function_calling_v2.json`
 - `configs/datasets/hephaestus_forge.json`
-- `configs/datasets/t1.json`
 
 4) 运行（datasets_root 指向你本地数据目录）：
 
@@ -44,7 +43,6 @@ PYTHONPATH=src python -m cli.runner \
   --config-dir configs/datasets \
   --out-root out \
   --prepare \
-  --only Toucan-1.5M \
   -B 1 \
   --workers 32
 ```
@@ -106,5 +104,4 @@ PYTHONPATH=src python -m cli.runner ... -B 1 --chars-per-token 2.5
 - agent-data-collection：jsonl
 - glaive-function-calling-v2：json（顶层数组 `[...]`）
 - Hephaestus-Forge：json（顶层数组 `[...]`）
-- T1：csv
 
