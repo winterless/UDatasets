@@ -13,7 +13,7 @@ import json
 import os
 import sys
 from pathlib import Path
-from math import ceil
+import random
 from typing import Callable, Dict, IO, Literal
 
 
@@ -51,6 +51,7 @@ from datatrove.pipeline.readers import CSVReader as CsvReader  # noqa: E402  # t
 from datatrove.pipeline.readers import JsonlReader, ParquetReader  # noqa: E402  # type: ignore[import-not-found]
 from datatrove.pipeline.readers.base import BaseDiskReader  # noqa: E402  # type: ignore[import-not-found]
 from datatrove.pipeline.writers.disk_base import DiskWriter  # noqa: E402  # type: ignore[import-not-found]
+from datatrove.pipeline.base import PipelineStep  # noqa: E402  # type: ignore[import-not-found]
 from datatrove.utils.logging import logger  # noqa: E402  # type: ignore[import-not-found]
 
 from pipelines.dataset_adapters import BASE_ADAPTERS  # noqa: E402
@@ -94,6 +95,45 @@ class StdJsonlWriter(DiskWriter):
     def _write(self, document: dict, file_handler: IO, _filename: str):
         line = (json.dumps(document, ensure_ascii=False) + "\n").encode("utf-8")
         file_handler.write(line)
+
+
+class TokenBudgetLimiter(PipelineStep):
+    """
+    Stop the pipeline after writing approximately `token_budget` tokens.
+
+    Token estimation is intentionally rough:
+      tokens ~= len(text) / chars_per_token (default 2).
+
+    Note: this limiter is per-rank. For a true global budget, run with tasks=1.
+    """
+
+    name = "🎛️ TokenBudgetLimiter"
+
+    def __init__(self, token_budget: int, *, seed: int = 42, chars_per_token: float = 2.0):
+        super().__init__()
+        self.token_budget = int(token_budget)
+        self.chars_per_token = float(chars_per_token)
+        self._rng = random.Random(int(seed))
+
+    def _estimate_tokens(self, text: str) -> int:
+        if not text:
+            return 0
+        # very rough heuristic; good enough for budgeted sampling
+        return max(1, int(len(text) / max(self.chars_per_token, 1e-6)))
+
+    def run(self, data, rank: int = 0, world_size: int = 1):  # noqa: ANN001
+        consumed = 0
+        yielded_any = False
+        for doc in data:
+            t = self._estimate_tokens(getattr(doc, "text", "") or "")
+            # Ensure we yield at least one document if any exist, even if it exceeds the budget.
+            if consumed + t > self.token_budget and yielded_any:
+                break
+            consumed += t
+            yielded_any = True
+            yield doc
+            if consumed >= self.token_budget:
+                break
 
 
 # -------------------------
@@ -194,14 +234,39 @@ def build_reader(source: dict, datasets_root: Path, adapter_fn: Callable):
     stype = source["type"]
     base = datasets_root / source["data_dir"]
     glob = source["glob"]
+    shuffle_files = bool(source.get("_shuffle_files", False))
     if stype == "jsonl":
-        return JsonlReader(str(base), glob_pattern=glob, recursive=("**" in glob), adapter=adapter_fn)
+        return JsonlReader(
+            str(base),
+            glob_pattern=glob,
+            recursive=("**" in glob),
+            adapter=adapter_fn,
+            shuffle_files=shuffle_files,
+        )
     if stype == "parquet":
-        return ParquetReader(str(base), glob_pattern=glob, recursive=("**" in glob), adapter=adapter_fn)
+        return ParquetReader(
+            str(base),
+            glob_pattern=glob,
+            recursive=("**" in glob),
+            adapter=adapter_fn,
+            shuffle_files=shuffle_files,
+        )
     if stype == "csv":
-        return CsvReader(str(base), glob_pattern=glob, recursive=("**" in glob), adapter=adapter_fn)
+        return CsvReader(
+            str(base),
+            glob_pattern=glob,
+            recursive=("**" in glob),
+            adapter=adapter_fn,
+            shuffle_files=shuffle_files,
+        )
     if stype == "json_array":
-        return JsonArrayReader(str(base), glob_pattern=glob, recursive=("**" in glob), adapter=adapter_fn)
+        return JsonArrayReader(
+            str(base),
+            glob_pattern=glob,
+            recursive=("**" in glob),
+            adapter=adapter_fn,
+            shuffle_files=shuffle_files,
+        )
     raise ValueError(f"Unknown source type: {stype}")
 
 
@@ -216,6 +281,9 @@ def run_pipeline(
     only: str = "",
     compression: str | None = None,
     prepare: bool = False,
+    token_budget: int | None = None,
+    seed: int = 42,
+    chars_per_token: float = 2.0,
 ) -> int:
     """
     Backend API (NO argparse): run configured dataset pipelines using datatrove.
@@ -248,6 +316,10 @@ def run_pipeline(
         if not source:
             print(f"[skip] {name}: no usable source found (paths missing or deps missing)", file=sys.stderr)
             continue
+        if token_budget:
+            # enable file-level shuffling to make early-stop sampling less biased
+            source = dict(source)
+            source["_shuffle_files"] = True
 
         reader = build_reader(source, datasets_root, adapter_fn)
         if limit != -1:
@@ -288,13 +360,17 @@ def run_pipeline(
         elif "tasks" in exec_cfg:
             tasks = int(exec_cfg.get("tasks", 20))
         else:
-            # If input is small, don't bother splitting into multiple ranks/tasks.
-            if total_bytes < min_bytes or file_count <= 1:
+            # Token-budget sampling is easiest to reason about with a single task (global budget).
+            if token_budget:
                 tasks = 1
             else:
-                # Default parallelism: cap to number of files to avoid empty ranks.
-                default_tasks = int(exec_cfg.get("default_tasks", 20))
-                tasks = max(1, min(file_count, default_tasks))
+                # If input is small, don't bother splitting into multiple ranks/tasks.
+                if total_bytes < min_bytes or file_count <= 1:
+                    tasks = 1
+                else:
+                    # Default parallelism: cap to number of files to avoid empty ranks.
+                    default_tasks = int(exec_cfg.get("default_tasks", 20))
+                    tasks = max(1, min(file_count, default_tasks))
 
         workers = int(workers_override) if workers_override is not None else int(exec_cfg.get("workers", 8))
         workers = max(1, min(workers, tasks))
@@ -302,6 +378,8 @@ def run_pipeline(
 
         output_filename = "${rank}.jsonl" if not compression else "${rank}.jsonl.gz"
         pipeline = [reader]
+        if token_budget:
+            pipeline.append(TokenBudgetLimiter(token_budget, seed=seed, chars_per_token=chars_per_token))
 
         # Main output: full Document dict (includes metadata/raw)
         pipeline.append(

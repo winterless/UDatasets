@@ -44,6 +44,8 @@ PYTHONPATH=src python -m cli.runner \
   --config-dir configs/datasets \
   --out-root out \
   --prepare \
+  --only Toucan-1.5M \
+  -B 1 \
   --workers 32
 ```
 
@@ -61,6 +63,25 @@ PYTHONPATH=src python -m cli.runner \
 - `text`: 训练文本
 
 示例：`out/prepare/Toucan-1.5M/000_00000.jsonl`
+
+### 按 token 预算抽样输出（-B）
+
+如果你想生成固定规模的训练语料（按 `text` 的 token 数量粗略估算），可以用：
+
+- `-B 1`：目标约 **1B tokens**
+- `-B 0.2`：目标约 **0.2B tokens**
+
+实现说明：
+ - token 数估算是近似：默认大致按 `len(text) / 2` 换算，不追求特别精确（可用 `--chars-per-token` 调整）
+- 输出体积（GB）会明显大于“纯 text”的估算，因为 prepare 是 JSONL（包含 uuid/key/引号/转义等开销）
+- 达到预算后会提前停止；如果数据不足则输出最大可用数据
+- 未显式指定 `--tasks` 且 config 也未指定 `executor.tasks` 时，会自动用 `tasks=1` 来保证预算是全局生效
+
+如需校准体量，可用 `--chars-per-token` 调整粗略换算（例如中文/代码类文本可能更接近 2–3 chars/token）：
+
+```bash
+PYTHONPATH=src python -m cli.runner ... -B 1 --chars-per-token 2.5
+```
 
 ### 并行参数（tasks/workers）的默认策略
 

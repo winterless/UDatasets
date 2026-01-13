@@ -30,6 +30,25 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--limit", type=int, default=-1, help="Limit documents (debug). -1 for full")
     ap.add_argument("--only", default="", help="Only run a single dataset by name (dataset.name)")
     ap.add_argument(
+        "-B",
+        "--token-billions",
+        type=float,
+        default=0.0,
+        help="Sample output to approximately B billion tokens (estimated from text length). 0 disables.",
+    )
+    ap.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed used for sampling/shuffling when --token-billions is set.",
+    )
+    ap.add_argument(
+        "--chars-per-token",
+        type=float,
+        default=2.0,
+        help="Token estimation heuristic for -B sampling: tokens ~= len(text) / chars_per_token (rough).",
+    )
+    ap.add_argument(
         "--prepare",
         action="store_true",
         help="Also write a CPT-friendly view under <out-root>/prepare/<dataset>/ with JSONL lines containing only {uuid,text}.",
@@ -55,6 +74,9 @@ def main(argv: list[str] | None = None) -> int:
         only=args.only,
         compression=(None if args.compression == "none" else args.compression),
         prepare=bool(args.prepare),
+        token_budget=int(args.token_billions * 1_000_000_000) if args.token_billions else None,
+        seed=int(args.seed),
+        chars_per_token=float(args.chars_per_token),
     )
 
 
