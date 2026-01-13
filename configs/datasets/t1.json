@@ -11,6 +11,10 @@
   ],
   "adapter": {
     "kind": "t1"
+  },
+  "executor": {
+    "target_shard_mb": 50,
+    "min_shard_mb": 2
   }
 }
 

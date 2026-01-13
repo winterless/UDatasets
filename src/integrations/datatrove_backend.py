@@ -102,14 +102,14 @@ class TokenBudgetLimiter(PipelineStep):
     Stop the pipeline after writing approximately `token_budget` tokens.
 
     Token estimation is intentionally rough:
-      tokens ~= len(text) / chars_per_token (default 2).
+      tokens ~= len(text) / chars_per_token (default 4).
 
     Note: this limiter is per-rank. For a true global budget, run with tasks=1.
     """
 
     name = "🎛️ TokenBudgetLimiter"
 
-    def __init__(self, token_budget: int, *, seed: int = 42, chars_per_token: float = 2.0):
+    def __init__(self, token_budget: int, *, seed: int = 42, chars_per_token: float = 4.0):
         super().__init__()
         self.token_budget = int(token_budget)
         self.chars_per_token = float(chars_per_token)
@@ -230,15 +230,16 @@ def make_adapter(base_adapter: Callable, dataset_name: str, config_path: str):
     return _adapter
 
 
-def build_reader(source: dict, datasets_root: Path, adapter_fn: Callable):
+def build_reader(source: dict, datasets_root: Path, adapter_fn: Callable, *, paths_file: str | None = None):
     stype = source["type"]
     base = datasets_root / source["data_dir"]
-    glob = source["glob"]
+    glob = source.get("glob") or ""
     shuffle_files = bool(source.get("_shuffle_files", False))
     if stype == "jsonl":
         return JsonlReader(
             str(base),
-            glob_pattern=glob,
+            paths_file=paths_file,
+            glob_pattern=(glob or None),
             recursive=("**" in glob),
             adapter=adapter_fn,
             shuffle_files=shuffle_files,
@@ -246,7 +247,8 @@ def build_reader(source: dict, datasets_root: Path, adapter_fn: Callable):
     if stype == "parquet":
         return ParquetReader(
             str(base),
-            glob_pattern=glob,
+            paths_file=paths_file,
+            glob_pattern=(glob or None),
             recursive=("**" in glob),
             adapter=adapter_fn,
             shuffle_files=shuffle_files,
@@ -254,7 +256,8 @@ def build_reader(source: dict, datasets_root: Path, adapter_fn: Callable):
     if stype == "csv":
         return CsvReader(
             str(base),
-            glob_pattern=glob,
+            paths_file=paths_file,
+            glob_pattern=(glob or None),
             recursive=("**" in glob),
             adapter=adapter_fn,
             shuffle_files=shuffle_files,
@@ -262,7 +265,8 @@ def build_reader(source: dict, datasets_root: Path, adapter_fn: Callable):
     if stype == "json_array":
         return JsonArrayReader(
             str(base),
-            glob_pattern=glob,
+            paths_file=paths_file,
+            glob_pattern=(glob or None),
             recursive=("**" in glob),
             adapter=adapter_fn,
             shuffle_files=shuffle_files,
@@ -283,7 +287,7 @@ def run_pipeline(
     prepare: bool = False,
     token_budget: int | None = None,
     seed: int = 42,
-    chars_per_token: float = 2.0,
+    chars_per_token: float = 4.0,
 ) -> int:
     """
     Backend API (NO argparse): run configured dataset pipelines using datatrove.
@@ -321,7 +325,29 @@ def run_pipeline(
             source = dict(source)
             source["_shuffle_files"] = True
 
-        reader = build_reader(source, datasets_root, adapter_fn)
+        # Support multi-glob sources via a generated paths file (union of patterns).
+        paths_file: str | None = None
+        globs = source.get("globs") or []
+        if not isinstance(globs, list):
+            globs = []
+        globs = [str(g).strip() for g in globs if str(g).strip()]
+        if globs:
+            base = datasets_root / source["data_dir"]
+            rel_paths: list[str] = []
+            for g in globs:
+                for p in base.glob(g):
+                    if p.is_file():
+                        rel_paths.append(p.relative_to(base).as_posix())
+            rel_paths = sorted(set(rel_paths))
+            if not rel_paths:
+                print(f"[skip] {name}: globs matched 0 files under {base}", file=sys.stderr)
+                continue
+            paths_file_path = (out_root / "_logs" / name / "paths.txt")
+            paths_file_path.parent.mkdir(parents=True, exist_ok=True)
+            paths_file_path.write_text("\n".join(rel_paths) + "\n", encoding="utf-8")
+            paths_file = str(paths_file_path)
+
+        reader = build_reader(source, datasets_root, adapter_fn, paths_file=paths_file)
         if limit != -1:
             reader.limit = limit
 
@@ -332,8 +358,18 @@ def run_pipeline(
 
         exec_cfg = cfg.get("executor") or {}
         base = datasets_root / source["data_dir"]
-        pattern = source["glob"]
-        matched_files = [p for p in base.glob(pattern) if p.is_file()]
+        pattern = (source.get("glob") or "").strip()
+        globs_for_stats = source.get("globs") or []
+        if not isinstance(globs_for_stats, list):
+            globs_for_stats = []
+        globs_for_stats = [str(g).strip() for g in globs_for_stats if str(g).strip()]
+
+        if globs_for_stats:
+            matched_files = []
+            for g in globs_for_stats:
+                matched_files.extend([p for p in base.glob(g) if p.is_file()])
+        else:
+            matched_files = [p for p in base.glob(pattern) if p.is_file()] if pattern else []
         file_count = len(matched_files)
         total_bytes = 0
         for p in matched_files:
@@ -409,7 +445,8 @@ def run_pipeline(
                 )
             )
 
-        print(f"[run] {name} source={source['type']} dir={source['data_dir']} glob={source['glob']}", file=sys.stderr)
+        glob_desc = pattern if pattern else (";".join(globs_for_stats) if globs_for_stats else "")
+        print(f"[run] {name} source={source['type']} dir={source['data_dir']} glob={glob_desc}", file=sys.stderr)
         LocalPipelineExecutor(pipeline=pipeline, logging_dir=str(logs_dir), tasks=tasks, workers=workers).run()
         print(f"[ok] {name} -> {ds_out}", file=sys.stderr)
 

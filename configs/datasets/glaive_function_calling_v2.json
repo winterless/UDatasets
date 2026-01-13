@@ -11,6 +11,10 @@
   ],
   "adapter": {
     "kind": "glaive"
+  },
+  "executor": {
+    "target_shard_mb": 50,
+    "min_shard_mb": 2
   }
 }
 

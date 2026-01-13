@@ -11,6 +11,10 @@
   ],
   "adapter": {
     "kind": "hephaestus"
+  },
+  "executor": {
+    "target_shard_mb": 50,
+    "min_shard_mb": 2
   }
 }
 

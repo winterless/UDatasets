@@ -1,11 +1,11 @@
 {
   "dataset": {
-    "name": "Toucan-1.5M"
+    "name": "Toucan-1.5M-qwen"
   },
   "sources": [
     {
       "type": "parquet",
-      "data_dir": "Toucan-1.5M/Toucan-1.5M/",
+      "data_dir": "Toucan-1.5M/Toucan-1.5M/Qwen3",
       "glob": "**/*.parquet"
     }
   ],
@@ -17,3 +17,5 @@
     "min_shard_mb": 2
   }
 }
+
+

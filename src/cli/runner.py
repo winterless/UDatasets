@@ -45,7 +45,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--chars-per-token",
         type=float,
-        default=2.0,
+        default=4.0,
         help="Token estimation heuristic for -B sampling: tokens ~= len(text) / chars_per_token (rough).",
     )
     ap.add_argument(

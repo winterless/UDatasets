@@ -72,7 +72,7 @@ PYTHONPATH=src python -m cli.runner \
 - `-B 0.2`：目标约 **0.2B tokens**
 
 实现说明：
- - token 数估算是近似：默认大致按 `len(text) / 2` 换算，不追求特别精确（可用 `--chars-per-token` 调整）
+ - token 数估算是近似：默认大致按 `len(text) / 4` 换算，不追求特别精确（可用 `--chars-per-token` 调整）
 - 输出体积（GB）会明显大于“纯 text”的估算，因为 prepare 是 JSONL（包含 uuid/key/引号/转义等开销）
 - 达到预算后会提前停止；如果数据不足则输出最大可用数据
 - 未显式指定 `--tasks` 且 config 也未指定 `executor.tasks` 时，会自动用 `tasks=1` 来保证预算是全局生效

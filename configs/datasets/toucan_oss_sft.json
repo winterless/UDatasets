@@ -1,12 +1,15 @@
 {
   "dataset": {
-    "name": "Toucan-1.5M"
+    "name": "Toucan-1.5M-oss+sft"
   },
   "sources": [
     {
       "type": "parquet",
-      "data_dir": "Toucan-1.5M/Toucan-1.5M/",
-      "glob": "**/*.parquet"
+      "data_dir": "Toucan-1.5M/Toucan-1.5M",
+      "globs": [
+        "OSS/**/*.parquet",
+        "SFT/**/*.parquet"
+      ]
     }
   ],
   "adapter": {
@@ -17,3 +20,5 @@
     "min_shard_mb": 2
   }
 }
+
+
