@@ -72,17 +72,56 @@ def agent_data_collection_adapter(self, data: JsonDict, path: str, id_in_file: i
     doc_id = doc_id if isinstance(doc_id, str) and doc_id else _stable_id_from_path(path, id_in_file)
 
     text = ""
+    # Multi-route fallback because agent-data-collection mixes several schemas:
+    # 1) {"conversations": [{"role": "...", "content": "..."}]}
+    # 2) {"conversations": [{"from": "...", "value": "..."}]}
+    # 3) {"content": [{"class_": "...", "source": "...", "content": "...", "description": "..."}]}  (db-style)
+    def _to_str(v: Any) -> str:
+        if v is None:
+            return ""
+        if isinstance(v, str):
+            return v
+        try:
+            return json.dumps(v, ensure_ascii=False)
+        except Exception:
+            return str(v)
+
     conv = raw.get("conversations")
     if isinstance(conv, list):
-        lines = []
+        lines: list[str] = []
         for m in conv:
             if not isinstance(m, dict):
                 continue
-            role = m.get("role", "")
-            content = m.get("content", "")
-            if isinstance(content, str) and content.strip():
-                lines.append(f"{role}: {content}".strip())
-        text = "\n".join(lines)
+            role = _to_str(m.get("role") or m.get("from") or m.get("speaker") or m.get("name") or "").strip()
+            content = _to_str(m.get("content") if "content" in m else (m.get("value") if "value" in m else m.get("text"))).strip()
+            if content:
+                lines.append(f"{role}: {content}".strip() if role else content)
+        text = "\n".join(lines).strip()
+
+    # db-style fallback: top-level `content` is a list of step dicts containing `content`/`description`
+    if not text:
+        steps = raw.get("content")
+        if isinstance(steps, list):
+            lines = []
+            for s in steps:
+                if not isinstance(s, dict):
+                    continue
+                role = _to_str(s.get("source") or s.get("class_") or "").strip()
+                main = _to_str(s.get("content")).strip()
+                desc = _to_str(s.get("description")).strip()
+                if main:
+                    lines.append(f"{role}: {main}".strip() if role else main)
+                if desc:
+                    lines.append(f"{role}.description: {desc}".strip() if role else desc)
+            text = "\n".join(lines).strip()
+
+    # Last-ditch fallback: common single-field prompts/questions.
+    if not text:
+        for k in ("question", "prompt", "instruction", "text", "input"):
+            v = raw.get(k)
+            if isinstance(v, str) and v.strip():
+                text = v.strip()
+                break
 
     return {"text": _ensure_text(text), "id": doc_id, "metadata": {"dataset": "agent-data-collection", "raw": raw}}
 

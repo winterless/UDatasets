@@ -29,7 +29,7 @@ cd /home/unlimitediw/workspace/TYDeepResearch/UDatasets
 python -m pip install -e "/home/unlimitediw/workspace/datatrove[io]"
 ```
 
-3) 准备配置（每数据集一个 JSON，放在 `configs/datasets/`，已提供 4 个示例）：
+3) 准备配置（每数据集一个 JSON，放在 `configs/datasets/`）：
 - `configs/datasets/toucan_1_5m.json`（parquet/jsonl 二选一，优先 parquet）
 - `configs/datasets/agent_data_collection.json`
 - `configs/datasets/glaive_function_calling_v2.json`
@@ -45,6 +45,7 @@ PYTHONPATH=src python -m cli.runner \
   --prepare-only \
   -B 1 \
   --token-budget-parallel \
+  --system-ratio 0.5 \
   -j 20
 ```
 
@@ -83,6 +84,9 @@ PYTHONPATH=src python -m cli.runner ... --prepare-only
 - 输出体积（GB）会明显大于“纯 text”的估算，因为 prepare 是 JSONL（包含 uuid/key/引号/转义等开销）
 - 达到预算后会提前停止；如果数据不足则输出最大可用数据
 - `TokenBudgetLimiter` 是 **按 task(rank) 生效** 的：tasks=1 时最接近“全局预算”；tasks>1 时会把预算按 tasks **均分**，属于“近似全局预算”
+  - 注意：对于 JSONL 这种“按文件分片”的 reader，如果单个输入文件非常大，在 `tasks>1` 且预算均分时，可能导致该文件被某个 rank 提前截断。
+    - **最稳的做法**：开启 `--shard-jsonl-mb <MB>`，先把超大 JSONL 预切成多个 shard 文件（不解析、不改内容、只按行切分），让多个 task 分担处理，从而避免被截断，同时保持并行度。
+    - shards 会生成在：`<out-root>/_shards/<dataset>/`；同时会生成派生配置目录：`<out-root>/_configs_sharded/`（内部把 jsonl 数据源指向 shards）
 
 如果你希望在 `-B` 预算模式下也并行跑（更快，但预算是“近似全局”），可以加：
 
@@ -92,7 +96,25 @@ PYTHONPATH=src python -m cli.runner ... -B 1 --token-budget-parallel -j 20
 
 并行参数小结：
 - `-j/--parallelism N`：同时设置 `--tasks N` 和 `--workers N`（推荐日常使用）
+- `-J/--dataset-parallelism N`：同时跑 N 个数据集（按 config 顺序调度），减少“单数据集拖尾导致 CPU 空转”
 - `--tasks/--workers`：高级用法，分别控制输出分片数量（tasks）和同时并发数（workers）
+
+并行常见现象（不是卡死）：
+- 运行到后期只剩少数 worker/task 在跑：通常是分片负载不均的“尾部拖尾”（最后几个分片更大/更慢），属于正常现象
+- 后面的数据集“不动”：默认是串行跑数据集（`-J 1`）；如果想在拖尾时启动下一个数据集，用 `-J 2` / `-J 3` 等
+
+常见坑：
+- 如果看到日志提示 `Not doing anything as all ... tasks have already been completed.`，说明 datatrove 根据 `<out-root>/_logs/<dataset>/` 认为已完成，会跳过运行。
+  - 若你删了输出文件但没删 logs，或切换了输出模式（例如从 full 切到 `--prepare-only`），可能导致“这次输出为空”
+  - 解决：加 `--force` 强制清理该 dataset 的 logs+输出并重跑
+
+工具/系统说明混入（可选）：
+- 默认 prepare 只保留 `{uuid,text}`，很多样本的 `raw.system`（工具说明/格式约束）不会进入 `text`。
+- 如果你希望让模型“见过一些工具说明”，可以按比例混入（稳定可复现：基于 `--seed` + 样本 id 做 hash 选择）：例如让 10% 样本在 `text` 前面拼接 `raw.system`（截断到 2000 字符）：
+
+```bash
+PYTHONPATH=src python -m cli.runner ... --system-ratio 0.1 --system-max-chars 2000
+```
 
 如需校准体量，可用 `--chars-per-token` 调整粗略换算（例如中文/代码类文本可能更接近 2–3 chars/token）：
 
