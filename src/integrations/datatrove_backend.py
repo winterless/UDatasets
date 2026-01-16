@@ -18,6 +18,7 @@ import random
 import time
 import traceback
 import threading
+import hashlib
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from typing import Callable, Dict, IO, Literal
 
@@ -1528,17 +1529,85 @@ def run_pipeline(
         print(f"[info] exclude-ids: loaded {len(ids):,} ids from {root} in {dt:.1f}s", file=sys.stderr)
         return ids
 
-    exclude_workers_env = os.environ.get("UDATA_EXCLUDE_IDS_WORKERS", "").strip()
-    exclude_workers = 1
-    if exclude_workers_env:
+    blacklist_ids_cache: set[str] | None = None
+
+    def _get_blacklist_ids() -> set[str]:
+        nonlocal blacklist_ids_cache
+        if blacklist_ids_cache is not None:
+            return blacklist_ids_cache
+        if not exclude_ids_dir:
+            blacklist_ids_cache = set()
+            return blacklist_ids_cache
+
+        # Simple persistent cache: if present and not --force, never rescan exclude_ids_dir.
+        # Cache path is keyed only by the resolved exclude_ids_dir path (no expensive validation).
+        cache_key = hashlib.sha1(str(exclude_ids_dir).encode("utf-8")).hexdigest()[:16]
+        # Persisted cache lives under the existing out/ scratch namespace used by exclude-ids scanning.
+        # User-facing convention: treat this as "the exclude-ids cache", not a generic `_cache` folder.
+        cache_dir = out_root / "_exclude_ids_cache" / "persist" / cache_key
+        cache_file = cache_dir / "ids.txt"
+        cache_meta = cache_dir / "meta.json"
+        if cache_file.exists() and not force:
+            ids: set[str] = set()
+            t0 = time.monotonic()
+            try:
+                with cache_file.open("rt", encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        s = line.strip()
+                        if s:
+                            ids.add(s)
+                dt = time.monotonic() - t0
+                print(
+                    f"[info] exclude-ids: using cache {cache_file} (ids={len(ids):,}, {dt:.1f}s). "
+                    f"Use --force to rebuild.",
+                    file=sys.stderr,
+                )
+                blacklist_ids_cache = ids
+                return blacklist_ids_cache
+            except Exception:
+                # Fall back to rebuild below.
+                pass
+
+        exclude_workers_env = os.environ.get("UDATA_EXCLUDE_IDS_WORKERS", "").strip()
+        exclude_workers = 1
+        if exclude_workers_env:
+            try:
+                exclude_workers = int(exclude_workers_env)
+            except Exception:
+                exclude_workers = 1
+        else:
+            # Follow user-level parallelism: `-j` sets workers_override; otherwise fall back to tasks_override.
+            exclude_workers = int(workers_override or tasks_override or 1)
+
+        ids = _load_blacklist_ids(exclude_ids_dir, workers=exclude_workers)
+        blacklist_ids_cache = ids
+
+        # Write cache for next run
         try:
-            exclude_workers = int(exclude_workers_env)
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            tmp = cache_dir / f".ids.txt.tmp.{os.getpid()}"
+            with tmp.open("wt", encoding="utf-8") as w:
+                for s in sorted(ids):
+                    w.write(s)
+                    w.write("\n")
+            tmp.replace(cache_file)
+            cache_meta.write_text(
+                json.dumps(
+                    {
+                        "exclude_ids_dir": str(exclude_ids_dir),
+                        "ids": int(len(ids)),
+                        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            print(f"[info] exclude-ids: wrote cache {cache_file} (ids={len(ids):,})", file=sys.stderr)
         except Exception:
-            exclude_workers = 1
-    else:
-        # Follow user-level parallelism: `-j` sets workers_override; otherwise fall back to tasks_override.
-        exclude_workers = int(workers_override or tasks_override or 1)
-    blacklist_ids = _load_blacklist_ids(exclude_ids_dir, workers=exclude_workers)
+            pass
+        return blacklist_ids_cache
 
     def _stage(msg: str, *, dataset: str = "") -> None:
         ds = f" {dataset}:" if dataset else ""
@@ -1597,6 +1666,38 @@ def run_pipeline(
                 return 0
 
             exec_cfg = cfg.get("executor") or {}
+
+            # --- fast resume guard (skip before any expensive work, including exclude-ids scan) ---
+            ds_out = out_root / name
+            logs_dir = out_root / "_logs" / name
+
+            want_full = (not prepare_only) and (not mixed_name)
+            want_prepare = bool(prepare or mixed_name)
+
+            def _has_any_jsonl(folder: Path, pattern: str = "") -> bool:
+                if not folder.exists():
+                    return False
+                if pattern:
+                    return any(folder.glob(pattern))
+                return any(folder.glob("*.jsonl")) or any(folder.glob("*.jsonl.gz")) or any(folder.glob("*.jsonl.*"))
+
+            outputs_ok = True
+            if want_full and not _has_any_jsonl(ds_out):
+                outputs_ok = False
+            if want_prepare:
+                if mixed_name:
+                    mixed_dir = out_root / "mixed" / mixed_name
+                    # In mixed mode, each dataset writes files named "<dataset>__${rank}.jsonl".
+                    if not _has_any_jsonl(mixed_dir, f"{name}__*.jsonl"):
+                        outputs_ok = False
+                else:
+                    prep_dir = out_root / "prepare" / name
+                    if not _has_any_jsonl(prep_dir):
+                        outputs_ok = False
+
+            if outputs_ok and not force:
+                print(f"[skip] {name}: outputs already exist; skipping (use --force to re-run)", file=sys.stderr)
+                return 0
 
             # --- token budget (config-driven) ---
             def _cfg_token_budget() -> int | None:
@@ -1752,8 +1853,6 @@ def run_pipeline(
             if limit != -1:
                 reader.limit = limit
 
-            ds_out = out_root / name
-            logs_dir = out_root / "_logs" / name
             ds_out.mkdir(parents=True, exist_ok=True)
             logs_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1950,8 +2049,10 @@ def run_pipeline(
             # --- pipeline ---
             output_filename = "${rank}.jsonl" if not compression else "${rank}.jsonl.gz"
             pipeline: list = [reader]
-            if blacklist_ids:
-                pipeline.append(ExcludeIdsFilter(blacklist_ids, dataset_name=name, mixed=bool(mixed_name)))
+            if exclude_ids_dir:
+                ids = _get_blacklist_ids()
+                if ids:
+                    pipeline.append(ExcludeIdsFilter(ids, dataset_name=name, mixed=bool(mixed_name)))
             if eff_token_budget:
                 per_rank_budget = int(eff_token_budget)
                 if tasks > 1:
@@ -2007,17 +2108,13 @@ def run_pipeline(
                     )
                 )
 
-            def _has_any_jsonl(folder: Path) -> bool:
-                if not folder.exists():
-                    return False
-                return any(folder.glob("*.jsonl")) or any(folder.glob("*.jsonl.gz")) or any(folder.glob("*.jsonl.*"))
-
             required_dirs: list[Path] = []
-            if mixed_name:
-                required_dirs.append(out_root / "mixed" / mixed_name)
-            elif prepare:
-                required_dirs.append(out_root / "prepare" / name)
-            if not prepare_only:
+            if want_prepare:
+                if mixed_name:
+                    required_dirs.append(out_root / "mixed" / mixed_name)
+                else:
+                    required_dirs.append(out_root / "prepare" / name)
+            if want_full:
                 required_dirs.append(ds_out)
 
             outputs_ok = True
