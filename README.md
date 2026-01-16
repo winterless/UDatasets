@@ -105,3 +105,11 @@ PYTHONPATH=src python -m cli.runner \
   - `token_budget_parallel`：true/false（true 时允许并行 tasks，预算会按 task 拆分，近似全局）
   - `chars_per_token`：token 估算系数（默认 4.0）
   - `seed`：采样/洗牌 seed（默认继承 CLI `--seed`）
+  - `token_budget_mode`（可选）：
+    - `per_rank`（默认行为）：使用 `TokenBudgetLimiter`，预算是 **按 rank** 生效；tasks>1 时会把预算拆分到每个 rank
+    - `global_pool`（jsonl/parquet）：先把该数据集所有输入文件加入一个“全局池”，按 seed 稳定洗牌后流式抽样到目标 token，**预写**为 `tasks` 个临时 shard：
+      - `<out-root>/_pool/<dataset_name>/pool_*.jsonl`
+      - 然后 datatrove 再读取这些 shard 并输出，因此最终通常会得到 **m=tasks 个输出文件**
+      - 这个模式用于避免“单个大文件被分配到某个 rank 导致被 token 预算截断”的问题
+    - 也支持别名：`global_token_pool: true`（等价于 `token_budget_mode: "global_pool"`）
+  - `global_pool_workers`（可选，仅 parquet 时有明显意义）：构建 `_pool` 临时 shard 时的并行进程数（默认跟随 CLI `-j/--parallelism` 里的 workers）
