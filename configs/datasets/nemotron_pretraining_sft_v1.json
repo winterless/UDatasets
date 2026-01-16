@@ -1,21 +1,22 @@
 {
+  "enabled": false,
   "dataset": {
-    "name": "Toucan-1.5M"
+    "name": "Nemotron-Pretraining-SFT-v1"
   },
   "sources": [
     {
       "type": "parquet",
-      "data_dir": "Toucan-1.5M/Toucan-1.5M/",
+      "data_dir": "Nemotron-Pretraining-SFT-v1",
       "glob": "**/*.parquet"
     }
   ],
   "adapter": {
-    "kind": "toucan"
+    "kind": "nemotron-pretraining-sft-v1"
   },
   "executor": {
     "target_shard_mb": 50,
     "min_shard_mb": 2,
     "token_billions": 0.0
-  },
-  "enabled": true
+  }
 }
+

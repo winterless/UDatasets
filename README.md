@@ -6,6 +6,13 @@
 
 - `src/`: 代码（按功能划分目录）
 - `configs/datasets/*.json`: 数据集配置（每数据集一个）
+
+### 配置开关（enabled）
+每个 `configs/datasets/*.json` 都支持：
+
+- `enabled: true|false`（默认 true）
+
+只有 `enabled: true` 的配置才会被处理；设为 false 会被跳过。
   - 本工程只通过 datatrove backend 的“输入/输出”与 datatrove 交互（见 `src/integrations/datatrove_backend.py`）
 
 ## 统一入口：Datatrove 驱动（输出标准 Document：text/id/metadata.raw）

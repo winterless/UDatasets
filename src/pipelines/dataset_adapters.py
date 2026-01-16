@@ -98,6 +98,20 @@ def agent_data_collection_adapter(self, data: JsonDict, path: str, id_in_file: i
                 lines.append(f"{role}: {content}".strip() if role else content)
         text = "\n".join(lines).strip()
 
+    # Nemotron-style fallback: some datasets use top-level `messages` with {role, content}
+    if not text:
+        msgs = raw.get("messages")
+        if isinstance(msgs, list):
+            lines = []
+            for m in msgs:
+                if not isinstance(m, dict):
+                    continue
+                role = _to_str(m.get("role") or m.get("from") or m.get("speaker") or m.get("name") or "").strip()
+                content = _to_str(m.get("content") if "content" in m else (m.get("value") if "value" in m else m.get("text"))).strip()
+                if content:
+                    lines.append(f"{role}: {content}".strip() if role else content)
+            text = "\n".join(lines).strip()
+
     # db-style fallback: top-level `content` is a list of step dicts containing `content`/`description`
     if not text:
         steps = raw.get("content")
@@ -143,11 +157,73 @@ def hephaestus_adapter(self, data: JsonDict, path: str, id_in_file: int | str) -
     return {"text": _ensure_text(text), "id": doc_id, "metadata": {"dataset": "Hephaestus-Forge", "raw": raw}}
 
 
+def nemotron_math_v2_adapter(self, data: JsonDict, path: str, id_in_file: int | str) -> JsonDict:
+    """
+    Nemotron-Math-v2 schema (only fields we care about):
+      {
+        "uuid": "xx",
+        "messages": [
+          {"role": "user", "content": "..."},
+          {"role": "assistant", "content": "...", "reasoning_content": "..."}
+        ],
+        ...
+      }
+
+    Desired output:
+      id = uuid
+      text = user + content + assistant + reasoning_content + content
+    We interpret that as a newline-joined sequence:
+      "user\\n<user.content>\\nassistant\\n<assistant.reasoning_content>\\n<assistant.content>"
+    (and we keep message order if multiple turns exist).
+    """
+    raw = dict(data)
+    uuid = raw.get("uuid")
+    doc_id = uuid if isinstance(uuid, str) and uuid else _stable_id_from_path(path, id_in_file)
+
+    msgs = raw.get("messages")
+    parts: list[str] = []
+    if isinstance(msgs, list):
+        for m in msgs:
+            if not isinstance(m, dict):
+                continue
+            role = m.get("role")
+            role_s = role.strip() if isinstance(role, str) else ""
+            if role_s:
+                parts.append(role_s)
+            content = m.get("content")
+            if isinstance(content, str) and content.strip():
+                parts.append(content.strip())
+            if role_s == "assistant":
+                rc = m.get("reasoning_content")
+                if isinstance(rc, str) and rc.strip():
+                    parts.append(rc.strip())
+    text = "\n".join(parts).strip()
+    return {"text": _ensure_text(text), "id": doc_id, "metadata": {"dataset": "Nemotron-Math-v2", "raw": raw}}
+
+
+def nemotron_pretraining_sft_v1_adapter(self, data: JsonDict, path: str, id_in_file: int | str) -> JsonDict:
+    """
+    Nemotron-Pretraining-SFT-v1 schema (only fields we care about):
+      {"id": "xx", "text": "xxxx", ...}
+
+    Desired output:
+      id = raw.id
+      text = raw.text
+    """
+    raw = dict(data)
+    rid = raw.get("id")
+    doc_id = rid if isinstance(rid, str) and rid else _stable_id_from_path(path, id_in_file)
+    text = raw.get("text") if isinstance(raw.get("text"), str) else ""
+    return {"text": _ensure_text(text), "id": doc_id, "metadata": {"dataset": "Nemotron-Pretraining-SFT-v1", "raw": raw}}
+
+
 BASE_ADAPTERS: dict[str, Callable] = {
     "toucan": toucan_adapter,
     "agent-data-collection": agent_data_collection_adapter,
     "glaive": glaive_adapter,
     "hephaestus": hephaestus_adapter,
+    "nemotron-math-v2": nemotron_math_v2_adapter,
+    "nemotron-pretraining-sft-v1": nemotron_pretraining_sft_v1_adapter,
 }
 
 

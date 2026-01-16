@@ -1,0 +1,24 @@
+{
+  "enabled": false,
+  "dataset": {
+    "name": "Nemotron-Math-v2"
+  },
+  "sources": [
+    {
+      "type": "jsonl",
+      "data_dir": "Nemotron-Math-v2/data",
+      "glob": "**/*.jsonl",
+      "path_keywords": []
+    }
+  ],
+  "adapter": {
+    "kind": "nemotron-math-v2"
+  },
+  "executor": {
+    "target_shard_mb": 50000000,
+    "tasks": 1,
+    "min_shard_mb": 2,
+    "token_billions": 40
+  }
+}
+

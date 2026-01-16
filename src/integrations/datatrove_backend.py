@@ -574,6 +574,15 @@ def run_pipeline(
         if only and name != only:
             return 0
 
+        # Per-config gating: only run configs that are explicitly enabled.
+        # Supported locations (first match wins):
+        # - top-level `enabled`
+        # - `dataset.enabled`
+        enabled = cfg.get("enabled", ds.get("enabled", True))
+        if enabled is not True:
+            print(f"[skip] {name}: disabled (enabled={enabled!r})", file=sys.stderr)
+            return 0
+
         exec_cfg = cfg.get("executor") or {}
 
         # Token-budget sampling is controlled via config (executor.*), with optional global overrides
@@ -624,6 +633,45 @@ def run_pipeline(
         if not source:
             print(f"[skip] {name}: no usable source found (paths missing or deps missing)", file=sys.stderr)
             return 0
+
+        def _get_path_keywords(src: dict) -> list[str]:
+            """
+            Optional file/folder keyword filter:
+            Only keep files whose *relative path under data_dir* contains any of these substrings.
+
+            Config keys supported:
+            - source.path_keywords: ["low", "part00"] (list)
+            - source.path_keyword: "low" (single string)
+            - source.include_keywords: ["..."] (alias)
+            """
+            kws = src.get("path_keywords", src.get("include_keywords", []))
+            if isinstance(kws, str):
+                kws = [kws]
+            if not isinstance(kws, list):
+                kws = []
+            if isinstance(src.get("path_keyword"), str) and src.get("path_keyword").strip():
+                kws = list(kws) + [src.get("path_keyword")]
+            out: list[str] = []
+            for k in kws:
+                s = str(k).strip()
+                if s:
+                    out.append(s)
+            # de-dupe, stable
+            seen = set()
+            dedup: list[str] = []
+            for k in out:
+                if k not in seen:
+                    seen.add(k)
+                    dedup.append(k)
+            return dedup
+
+        path_keywords = _get_path_keywords(source)
+
+        def _kw_match(rel_posix: str) -> bool:
+            if not path_keywords:
+                return True
+            rp = str(rel_posix)
+            return any(k in rp for k in path_keywords)
         if eff_token_budget:
             # enable file-level shuffling to make early-stop sampling less biased
             source = dict(source)
@@ -641,10 +689,31 @@ def run_pipeline(
             for g in globs:
                 for p in base.glob(g):
                     if p.is_file():
-                        rel_paths.append(p.relative_to(base).as_posix())
+                        rp = p.relative_to(base).as_posix()
+                        if _kw_match(rp):
+                            rel_paths.append(rp)
             rel_paths = sorted(set(rel_paths))
             if not rel_paths:
                 print(f"[skip] {name}: globs matched 0 files under {base}", file=sys.stderr)
+                return 0
+            paths_file_path = (out_root / "_paths" / name / "paths.txt")
+            paths_file_path.parent.mkdir(parents=True, exist_ok=True)
+            paths_file_path.write_text("\n".join(rel_paths) + "\n", encoding="utf-8")
+            paths_file = str(paths_file_path)
+        elif path_keywords:
+            # Single-glob keyword filtering: generate a paths file so readers only see the filtered subset.
+            base = datasets_root / source["data_dir"]
+            pattern = (source.get("glob") or "").strip()
+            rel_paths = []
+            if pattern:
+                for p in base.glob(pattern):
+                    if p.is_file():
+                        rp = p.relative_to(base).as_posix()
+                        if _kw_match(rp):
+                            rel_paths.append(rp)
+            rel_paths = sorted(set(rel_paths))
+            if not rel_paths:
+                print(f"[skip] {name}: keyword filter matched 0 files under {base} (keywords={path_keywords})", file=sys.stderr)
                 return 0
             paths_file_path = (out_root / "_paths" / name / "paths.txt")
             paths_file_path.parent.mkdir(parents=True, exist_ok=True)
@@ -673,6 +742,8 @@ def run_pipeline(
                 matched_files.extend([p for p in base.glob(g) if p.is_file()])
         else:
             matched_files = [p for p in base.glob(pattern) if p.is_file()] if pattern else []
+        if path_keywords:
+            matched_files = [p for p in matched_files if _kw_match(p.relative_to(base).as_posix())]
         file_count = len(matched_files)
         total_bytes = 0
         for p in matched_files:
