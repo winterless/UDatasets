@@ -55,6 +55,13 @@ PYTHONPATH=src python -m cli.runner \
 
 默认不压缩输出（`00000.jsonl`）。如需 gzip 压缩，传 `--compression gzip`，则输出为 `00000.jsonl.gz`。
 
+
+### 去重/跳过已存在的 id/uuid（黑名单文件夹）
+如果你有一批历史产物（比如 `out/prepare/<dataset>/` 或 `out/mixed/<name>/`），想在新一轮生成时跳过这些样本，可以传：
+
+- `--exclude-ids-dir <DIR>`：递归扫描 `<DIR>` 下所有文件，收集每行 JSON 的 `uuid/id/doc_id`（或纯文本行）作为黑名单，新的输出将跳过这些 id。
+
+提示：在 `--mixed` 模式下，历史 uuid 往往是 `<dataset>::<id>`，黑名单会同时匹配 raw id 和这种带前缀的 uuid。
 ### 训练用 prepare 输出（仅 uuid + text）
 
 如果你要做 CPT（继续预训练），通常只需要 `text`（以及可选的样本 id）。

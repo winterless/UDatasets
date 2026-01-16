@@ -423,6 +423,7 @@ def run_pipeline(
     dataset_parallelism: int = 1,
     force: bool = False,
     mixed_name: str = "",
+    exclude_ids_dir: str = "",
     system_ratio: float = 0.0,
     system_max_chars: int = 2000,
     seed: int = 42,
@@ -439,6 +440,131 @@ def run_pipeline(
     if not cfgs:
         print(f"[error] no configs found under {config_dir}", file=sys.stderr)
         return 2
+
+    def _load_blacklist_ids(folder: str) -> set[str]:
+        """
+        Load a blacklist of ids/uuids from any files under `folder`.
+
+        Supported inputs:
+        - JSONL / JSONL.GZ where each line is a JSON object containing `uuid` or `id` (or `doc_id`)
+        - plain text where each non-empty line is treated as an id/uuid
+        - JSON lines that are a bare string are treated as an id/uuid
+        """
+        if not folder:
+            return set()
+        root = Path(folder)
+        if not root.exists() or not root.is_dir():
+            print(f"[warn] exclude_ids_dir={folder!r} does not exist or is not a directory; ignoring", file=sys.stderr)
+            return set()
+
+        ids: set[str] = set()
+        files: list[Path] = []
+        for p in root.rglob("*"):
+            if p.is_file():
+                files.append(p)
+        files = sorted(files)
+
+        def _add(v) -> None:  # noqa: ANN001
+            if v is None:
+                return
+            if isinstance(v, (int, float)):
+                v = str(v)
+            if not isinstance(v, str):
+                return
+            s = v.strip()
+            if s:
+                ids.add(s)
+
+        for p in files:
+            # prefer streaming; treat unknown files as plain text
+            try:
+                if p.suffix == ".gz" and p.name.endswith(".jsonl.gz"):
+                    import gzip
+
+                    with gzip.open(p, "rt", encoding="utf-8", errors="replace") as f:
+                        for line in f:
+                            s = line.strip()
+                            if not s:
+                                continue
+                            if not (s.startswith("{") or s.startswith("[")):
+                                _add(s)
+                                continue
+                            try:
+                                obj = json.loads(s)
+                            except Exception:
+                                continue
+                            if isinstance(obj, str):
+                                _add(obj)
+                            elif isinstance(obj, dict):
+                                _add(obj.get("uuid"))
+                                _add(obj.get("id"))
+                                _add(obj.get("doc_id"))
+                    continue
+
+                if p.suffix == ".jsonl":
+                    with p.open("rt", encoding="utf-8", errors="replace") as f:
+                        for line in f:
+                            s = line.strip()
+                            if not s:
+                                continue
+                            if not (s.startswith("{") or s.startswith("[")):
+                                _add(s)
+                                continue
+                            try:
+                                obj = json.loads(s)
+                            except Exception:
+                                continue
+                            if isinstance(obj, str):
+                                _add(obj)
+                            elif isinstance(obj, dict):
+                                _add(obj.get("uuid"))
+                                _add(obj.get("id"))
+                                _add(obj.get("doc_id"))
+                    continue
+
+                # fallback: plain text
+                with p.open("rt", encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        _add(line)
+            except Exception:
+                # ignore unreadable files (permissions, etc.)
+                continue
+
+        print(f"[info] exclude-ids: loaded {len(ids):,} ids from {root}", file=sys.stderr)
+        return ids
+
+    blacklist_ids = _load_blacklist_ids(exclude_ids_dir)
+
+    class ExcludeIdsFilter(PipelineStep):
+        """
+        Drop documents whose id is present in `blacklist_ids`.
+
+        In mixed mode, also matches dataset-prefixed ids of the form `<dataset>::<id>`.
+        """
+
+        name = "🚫 ExcludeIdsFilter"
+
+        def __init__(self, ids: set[str], *, dataset_name: str = "", mixed: bool = False):
+            super().__init__()
+            self._ids = ids
+            self._dataset_name = str(dataset_name or "")
+            self._mixed = bool(mixed)
+
+        def run(self, data, rank: int = 0, world_size: int = 1):  # noqa: ANN001
+            if not self._ids:
+                yield from data
+                return
+            prefix = f"{self._dataset_name}::" if (self._mixed and self._dataset_name) else ""
+            for doc in data:
+                uid = str(getattr(doc, "id", "") or "")
+                if not uid:
+                    yield doc
+                    continue
+                if uid in self._ids:
+                    continue
+                if prefix and f"{prefix}{uid}" in self._ids:
+                    continue
+                yield doc
 
     def _run_one(cfg: dict) -> int:
         ds = cfg.get("dataset", {})
@@ -674,6 +800,8 @@ def run_pipeline(
 
         output_filename = "${rank}.jsonl" if not compression else "${rank}.jsonl.gz"
         pipeline = [reader]
+        if blacklist_ids:
+            pipeline.append(ExcludeIdsFilter(blacklist_ids, dataset_name=name, mixed=bool(mixed_name)))
         if eff_token_budget:
             # NOTE: TokenBudgetLimiter is per-rank. We treat `token_budget` as a desired *global* budget.
             # - tasks=1: closest to a true global budget

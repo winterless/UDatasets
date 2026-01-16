@@ -204,6 +204,12 @@ def main(argv: list[str] | None = None) -> int:
         "to avoid collisions.",
     )
     ap.add_argument(
+        "--exclude-ids-dir",
+        default="",
+        help="Optional: folder containing prior outputs (or any files) from which to collect id/uuid values as a blacklist. "
+        "Any new documents whose id/uuid is in that blacklist will be skipped. Works with prepare-only and mixed mode.",
+    )
+    ap.add_argument(
         "--force",
         action="store_true",
         help="Force re-run a dataset by deleting its <out-root>/_logs/<dataset>/ state and existing outputs for that dataset.",
@@ -286,6 +292,7 @@ def main(argv: list[str] | None = None) -> int:
         system_ratio=float(args.system_ratio),
         system_max_chars=int(args.system_max_chars),
         mixed_name=str(args.mixed or "").strip(),
+        exclude_ids_dir=(str(Path(args.exclude_ids_dir).expanduser().resolve()) if args.exclude_ids_dir else ""),
     )
 
 
