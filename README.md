@@ -113,3 +113,22 @@ PYTHONPATH=src python -m cli.runner \
       - 这个模式用于避免“单个大文件被分配到某个 rank 导致被 token 预算截断”的问题
     - 也支持别名：`global_token_pool: true`（等价于 `token_budget_mode: "global_pool"`）
   - `global_pool_workers`（可选，仅 parquet 时有明显意义）：构建 `_pool` 临时 shard 时的并行进程数（默认跟随 CLI `-j/--parallelism` 里的 workers）
+
+- **后处理（输出文件合并）**：
+  - `merge_to_files`（可选，int）：datatrove 跑完后，把输出目录下的 `*.jsonl` / `*.jsonl.gz` **合并**成指定数量的文件（例如 1）。
+    - 适用场景：想用高 `tasks` 提速，但最终只想要少量大文件
+  - `merge_keep_inputs`（可选，bool，默认 false）：合并后是否保留原先的分片文件
+
+示例（并行跑，最终合并为 1 个文件）：
+
+```json
+{
+  "executor": {
+    "tasks": 192,
+    "workers": 192,
+    "token_billions": 1,
+    "token_budget_mode": "global_pool",
+    "merge_to_files": 1
+  }
+}
+```

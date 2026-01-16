@@ -352,6 +352,103 @@ def _global_pool_sample_jsonl_to_shards(
     return out_dir
 
 
+def _merge_jsonl_folder_to_n(
+    folder: Path,
+    *,
+    target_files: int,
+    keep_inputs: bool = False,
+    prefix: str = "merged",
+) -> list[Path]:
+    """
+    Merge many *.jsonl / *.jsonl.gz files under `folder` into `target_files` outputs.
+
+    - Streaming concat, deterministic by filename sort.
+    - Balances by size (greedy bin packing) so outputs are roughly even.
+    - Writes to temp files then atomically renames.
+    """
+    folder = Path(folder)
+    target_files = max(1, int(target_files))
+    keep_inputs = bool(keep_inputs)
+    if not folder.exists():
+        return []
+
+    # collect inputs
+    inputs: list[Path] = []
+    for pat in ("*.jsonl", "*.jsonl.gz"):
+        inputs.extend(list(folder.glob(pat)))
+    inputs = sorted({p for p in inputs if p.is_file()})
+    if len(inputs) <= target_files:
+        return inputs
+
+    # group by extension so we don't mix .jsonl and .jsonl.gz
+    by_ext: dict[str, list[Path]] = {}
+    for p in inputs:
+        ext = ".jsonl.gz" if p.name.endswith(".jsonl.gz") else ".jsonl"
+        by_ext.setdefault(ext, []).append(p)
+
+    written: list[Path] = []
+    for ext, files in by_ext.items():
+        if len(files) <= target_files:
+            written.extend(files)
+            continue
+
+        sizes = []
+        for p in files:
+            try:
+                sizes.append((p, p.stat().st_size))
+            except Exception:
+                sizes.append((p, 0))
+        sizes.sort(key=lambda x: x[1], reverse=True)
+
+        k = min(target_files, len(files))
+        bins: list[list[Path]] = [[] for _ in range(k)]
+        bin_sizes = [0] * k
+        for p, sz in sizes:
+            i = min(range(k), key=lambda j: bin_sizes[j])
+            bins[i].append(p)
+            bin_sizes[i] += int(sz)
+
+        out_paths = [folder / f"{prefix}_{i:05d}{ext}" for i in range(k)]
+        tmp_paths = [folder / f".{prefix}_{i:05d}{ext}.tmp" for i in range(k)]
+
+        # write
+        for i in range(k):
+            tmp = tmp_paths[i]
+            outp = out_paths[i]
+            try:
+                tmp.unlink()
+            except Exception:
+                pass
+            with tmp.open("wb") as w:
+                for src in sorted(bins[i]):
+                    try:
+                        with src.open("rb") as r:
+                            shutil.copyfileobj(r, w, length=8 * 1024 * 1024)
+                    except Exception:
+                        continue
+            try:
+                tmp.replace(outp)
+            except Exception:
+                # fallback rename
+                try:
+                    shutil.move(tmp.as_posix(), outp.as_posix())
+                except Exception:
+                    pass
+            written.append(outp)
+
+        if not keep_inputs:
+            for p in files:
+                # don't delete the new outputs (in case names overlap)
+                if p in out_paths:
+                    continue
+                try:
+                    p.unlink()
+                except Exception:
+                    pass
+
+    return written
+
+
 def _pool_worker_parquet_to_shards(
     *,
     worker_idx: int,
@@ -1990,6 +2087,26 @@ def run_pipeline(
             dur_s = time.monotonic() - t_exec0
             if dur_s >= 1.0:
                 print(f"[done] {name}: executor finished in {dur_s:.1f}s", file=sys.stderr)
+            # --- postprocess: merge outputs to a target number of files ---
+            merge_to = int(exec_cfg.get("merge_to_files", exec_cfg.get("merge_outputs_to_files", 0)) or 0)
+            if merge_to > 0:
+                keep_inputs = bool(exec_cfg.get("merge_keep_inputs", False))
+                for d in required_dirs:
+                    try:
+                        merged = _merge_jsonl_folder_to_n(
+                            Path(d),
+                            target_files=merge_to,
+                            keep_inputs=keep_inputs,
+                            prefix="merged",
+                        )
+                        if merged:
+                            print(
+                                f"[post] {name}: merged {Path(d)} -> {len(merged)} file(s) (target={merge_to}, keep_inputs={keep_inputs})",
+                                file=sys.stderr,
+                            )
+                    except Exception:
+                        print(f"[warn] {name}: post-merge failed for {d}", file=sys.stderr)
+                        print(traceback.format_exc(), file=sys.stderr)
             print(f"[ok] {name} -> {ds_out}", file=sys.stderr)
             return 0
         except Exception:

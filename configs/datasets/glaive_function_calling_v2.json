@@ -17,5 +17,5 @@
     "min_shard_mb": 2,
     "token_billions": 0.0
   },
-  "enabled": true
+  "enabled": false
 }

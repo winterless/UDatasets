@@ -1,5 +1,5 @@
 {
-  "enabled": false,
+  "enabled": true,
   "dataset": {
     "name": "Nemotron-Math-v2"
   },
@@ -8,17 +8,19 @@
       "type": "jsonl",
       "data_dir": "Nemotron-Math-v2/data",
       "glob": "**/*.jsonl",
-      "path_keywords": []
+      "path_keywords": ["high"]
     }
   ],
   "adapter": {
     "kind": "nemotron-math-v2"
   },
   "executor": {
+    "token_budget_mode": "global_pool",
     "target_shard_mb": 50000000,
-    "tasks": 1,
     "min_shard_mb": 2,
-    "token_billions": 40
+    "token_billions": 40,
+    "tasks": 192,
+    "merge_to_files": 1
   }
 }
 
