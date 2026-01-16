@@ -422,6 +422,7 @@ def run_pipeline(
     token_budget_parallel: bool = False,
     dataset_parallelism: int = 1,
     force: bool = False,
+    mixed_name: str = "",
     system_ratio: float = 0.0,
     system_max_chars: int = 2000,
     seed: int = 42,
@@ -447,6 +448,38 @@ def run_pipeline(
         if only and name != only:
             return 0
 
+        exec_cfg = cfg.get("executor") or {}
+
+        # Token-budget sampling is controlled via config (executor.*), with optional global overrides
+        # through the backend API (token_budget/token_budget_parallel/seed/chars_per_token).
+        #
+        # Supported keys:
+        # - executor.token_budget: int tokens
+        # - executor.token_billions: float B (converted to tokens via *1e9)
+        # - executor.token_budget_parallel: bool (split budget across tasks for more parallelism; approximate global budget)
+        # - executor.seed: int
+        # - executor.chars_per_token: float (tokens ~= len(text)/chars_per_token)
+        def _cfg_token_budget() -> int | None:
+            if token_budget is not None:
+                return int(token_budget)
+            if "token_budget" in exec_cfg:
+                try:
+                    return int(exec_cfg.get("token_budget"))
+                except Exception:
+                    return None
+            if "token_billions" in exec_cfg:
+                try:
+                    b = float(exec_cfg.get("token_billions"))
+                    return int(b * 1_000_000_000)
+                except Exception:
+                    return None
+            return None
+
+        eff_token_budget = _cfg_token_budget()
+        eff_token_budget_parallel = bool(exec_cfg.get("token_budget_parallel", token_budget_parallel))
+        eff_seed = int(exec_cfg.get("seed", seed))
+        eff_chars_per_token = float(exec_cfg.get("chars_per_token", chars_per_token))
+
         adapter_kind = (cfg.get("adapter", {}) or {}).get("kind", "")
         base_adapter = BASE_ADAPTERS.get(adapter_kind)
         if not base_adapter:
@@ -458,14 +491,14 @@ def run_pipeline(
             cfg.get("_config_path", ""),
             system_ratio=float(system_ratio),
             system_max_chars=int(system_max_chars),
-            seed=int(seed),
+            seed=int(eff_seed),
         )
 
         source = pick_source(cfg, datasets_root)
         if not source:
             print(f"[skip] {name}: no usable source found (paths missing or deps missing)", file=sys.stderr)
             return 0
-        if token_budget:
+        if eff_token_budget:
             # enable file-level shuffling to make early-stop sampling less biased
             source = dict(source)
             source["_shuffle_files"] = True
@@ -501,7 +534,6 @@ def run_pipeline(
         ds_out.mkdir(parents=True, exist_ok=True)
         logs_dir.mkdir(parents=True, exist_ok=True)
 
-        exec_cfg = cfg.get("executor") or {}
         base = datasets_root / source["data_dir"]
         pattern = (source.get("glob") or "").strip()
         globs_for_stats = source.get("globs") or []
@@ -571,7 +603,7 @@ def run_pipeline(
             est_lines = max(1.0, float(size_bytes) / max(avg_bytes_per_line, 1e-6))
             avg_text_chars = text_chars_sum / n
             est_chars = est_lines * avg_text_chars
-            return est_chars / max(chars_per_token, 1e-6)
+            return est_chars / max(eff_chars_per_token, 1e-6)
 
         # Output splitting: aim for ~10–15MB per output file by rolling writer files.
         # NOTE: this is the only way to get ~1000 output files from a dataset with few large input files
@@ -592,9 +624,9 @@ def run_pipeline(
             tasks = int(exec_cfg.get("tasks", 20))
         else:
             # Default parallelism:
-            # - If token_budget is set, default is tasks=1 for the closest-to-true global budget.
+            # - If token budget sampling is enabled, default is tasks=1 for the closest-to-true global budget.
             # - If token_budget_parallel is enabled, we allow parallel tasks (budget will be split across tasks).
-            if token_budget and not token_budget_parallel:
+            if eff_token_budget and not eff_token_budget_parallel:
                 tasks = 1
             else:
                 # If input is small, don't bother splitting into multiple ranks/tasks.
@@ -614,9 +646,9 @@ def run_pipeline(
         # Guardrail: when running with a per-task token budget (token_budget + tasks>1),
         # a single huge input file can be assigned to a single rank, causing that file to be truncated.
         # For JSONL sources, estimate the largest file and cap tasks so per-rank budget can cover it.
-        if token_budget and tasks > 1 and source.get("type") == "jsonl":
+        if eff_token_budget and tasks > 1 and source.get("type") == "jsonl":
             # per-rank budget is split when tasks>1
-            per_rank_budget = max(1, (int(token_budget) + tasks - 1) // tasks)
+            per_rank_budget = max(1, (int(eff_token_budget) + tasks - 1) // tasks)
             est_max_file_tokens = 0.0
             # sample only a handful of largest files for speed
             for p in sorted(matched_files, key=lambda x: getattr(x.stat(), "st_size", 0), reverse=True)[:5]:
@@ -625,7 +657,7 @@ def run_pipeline(
                     est_max_file_tokens = max(est_max_file_tokens, float(est))
             if est_max_file_tokens > 0 and per_rank_budget < est_max_file_tokens:
                 # compute max tasks allowed to avoid truncating the largest file
-                max_tasks_no_trunc = max(1, int(int(token_budget) // int(max(est_max_file_tokens, 1))))
+                max_tasks_no_trunc = max(1, int(int(eff_token_budget) // int(max(est_max_file_tokens, 1))))
                 if max_tasks_no_trunc < tasks:
                     print(
                         f"[warn] {name}: token_budget split across tasks would truncate a large JSONL file "
@@ -642,17 +674,17 @@ def run_pipeline(
 
         output_filename = "${rank}.jsonl" if not compression else "${rank}.jsonl.gz"
         pipeline = [reader]
-        if token_budget:
+        if eff_token_budget:
             # NOTE: TokenBudgetLimiter is per-rank. We treat `token_budget` as a desired *global* budget.
             # - tasks=1: closest to a true global budget
             # - tasks>1: approximate by splitting the budget across tasks (may still slightly overshoot)
-            per_rank_budget = int(token_budget)
+            per_rank_budget = int(eff_token_budget)
             if tasks > 1:
-                per_rank_budget = max(1, (int(token_budget) + tasks - 1) // tasks)
-            pipeline.append(TokenBudgetLimiter(per_rank_budget, seed=seed, chars_per_token=chars_per_token))
+                per_rank_budget = max(1, (int(eff_token_budget) + tasks - 1) // tasks)
+            pipeline.append(TokenBudgetLimiter(per_rank_budget, seed=eff_seed, chars_per_token=eff_chars_per_token))
 
         # Main output: full Document dict (includes metadata/raw)
-        if not prepare_only:
+        if not prepare_only and not mixed_name:
             pipeline.append(
                 StdJsonlWriter(
                     str(ds_out),
@@ -663,17 +695,26 @@ def run_pipeline(
             )
 
         # Prepare output: CPT-friendly lightweight view (uuid + text only)
-        if prepare:
-            prepare_out = out_root / "prepare" / name
+        if prepare or mixed_name:
+            # In mixed mode, write all datasets into a single folder under <out-root>/mixed/<mixed_name>/.
+            # We keep prepare schema {uuid,text} and prefix uuid with '<dataset>::' to avoid collisions.
+            if mixed_name:
+                prepare_out = out_root / "mixed" / mixed_name
+            else:
+                prepare_out = out_root / "prepare" / name
             prepare_out.mkdir(parents=True, exist_ok=True)
 
             def _prepare_adapter(self, document):  # noqa: ANN001
-                return {"uuid": document.id, "text": document.text}
+                uid = str(getattr(document, "id", ""))
+                if mixed_name:
+                    uid = f"{name}::{uid}"
+                return {"uuid": uid, "text": getattr(document, "text", "")}
 
+            prepare_filename = f"{name}__${{rank}}.jsonl" if mixed_name else "${rank}.jsonl"
             pipeline.append(
                 StdJsonlWriter(
                     str(prepare_out),
-                    output_filename="${rank}.jsonl",
+                    output_filename=prepare_filename,
                     compression=None,
                     adapter=_prepare_adapter,
                     max_file_size=writer_max_file_size,
@@ -691,7 +732,9 @@ def run_pipeline(
         # If outputs were deleted (or output mode changed, e.g. switching to --prepare-only),
         # we must also clear logs_dir to force a re-run.
         required_dirs: list[Path] = []
-        if prepare:
+        if mixed_name:
+            required_dirs.append(out_root / "mixed" / mixed_name)
+        elif prepare:
             required_dirs.append(out_root / "prepare" / name)
         if not prepare_only:
             required_dirs.append(ds_out)
@@ -729,9 +772,9 @@ def run_pipeline(
                 logs_dir.mkdir(parents=True, exist_ok=True)
 
         glob_desc = pattern if pattern else (";".join(globs_for_stats) if globs_for_stats else "")
-        tb = f"{token_budget}" if token_budget else "0"
-        tb_mode = "split" if (token_budget and tasks > 1) else ("global" if token_budget else "off")
-        out_mode = "prepare-only" if prepare_only else ("prepare+full" if prepare else "full")
+        tb = f"{eff_token_budget}" if eff_token_budget else "0"
+        tb_mode = "split" if (eff_token_budget and tasks > 1) else ("global" if eff_token_budget else "off")
+        out_mode = (f"mixed:{mixed_name}" if mixed_name else ("prepare-only" if prepare_only else ("prepare+full" if prepare else "full")))
         total_mb_str = f"{(total_bytes / (1024 * 1024)):.1f}MB" if total_bytes else "0MB"
         print(
             f"[run] {name} source={source['type']} dir={source['data_dir']} glob={glob_desc} "

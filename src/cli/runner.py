@@ -197,6 +197,13 @@ def main(argv: list[str] | None = None) -> int:
         help="Max chars of raw['system'] to prepend when --system-ratio>0 (to avoid huge repeated prompts).",
     )
     ap.add_argument(
+        "--mixed",
+        default="",
+        help="Enable explicit mixed mode: run all datasets as inputs but write a single combined JSONL under "
+        "<out-root>/mixed/<NAME>/. Output lines keep prepare schema {uuid,text} and prefix uuid with '<dataset>::' "
+        "to avoid collisions.",
+    )
+    ap.add_argument(
         "--force",
         action="store_true",
         help="Force re-run a dataset by deleting its <out-root>/_logs/<dataset>/ state and existing outputs for that dataset.",
@@ -216,29 +223,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--limit", type=int, default=-1, help="Limit documents (debug). -1 for full")
     ap.add_argument("--only", default="", help="Only run a single dataset by name (dataset.name)")
     ap.add_argument(
-        "-B",
-        "--token-billions",
-        type=float,
-        default=0.0,
-        help="Sample output to approximately B billion tokens (estimated from text length). 0 disables.",
-    )
-    ap.add_argument(
-        "--token-budget-parallel",
-        action="store_true",
-        help="Allow parallel tasks even when -B/--token-billions is set by splitting the token budget across tasks "
-        "(approximate global budget). Default behavior forces tasks=1 for a true global budget.",
-    )
-    ap.add_argument(
         "--seed",
         type=int,
         default=42,
-        help="Random seed used for sampling/shuffling when --token-billions is set.",
-    )
-    ap.add_argument(
-        "--chars-per-token",
-        type=float,
-        default=4.0,
-        help="Token estimation heuristic for -B sampling: tokens ~= len(text) / chars_per_token (rough).",
+        help="Seed used for stable sampling/shuffling (when enabled in dataset configs) and for --system-ratio selection.",
     )
     ap.add_argument(
         "--prepare",
@@ -292,14 +280,12 @@ def main(argv: list[str] | None = None) -> int:
         compression=(None if args.compression == "none" else args.compression),
         prepare=bool(args.prepare or args.prepare_only),
         prepare_only=bool(args.prepare_only),
-        token_budget=int(args.token_billions * 1_000_000_000) if args.token_billions else None,
-        token_budget_parallel=bool(args.token_budget_parallel),
         dataset_parallelism=int(args.dataset_parallelism),
         force=bool(args.force),
         seed=int(args.seed),
-        chars_per_token=float(args.chars_per_token),
         system_ratio=float(args.system_ratio),
         system_max_chars=int(args.system_max_chars),
+        mixed_name=str(args.mixed or "").strip(),
     )
 
 
