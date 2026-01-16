@@ -15,6 +15,9 @@ import shutil
 import sys
 from pathlib import Path
 import random
+import time
+import traceback
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, Dict, IO, Literal
 
@@ -130,12 +133,101 @@ class TokenBudgetLimiter(PipelineStep):
             t = self._estimate_tokens(getattr(doc, "text", "") or "")
             # Ensure we yield at least one document if any exist, even if it exceeds the budget.
             if consumed + t > self.token_budget and yielded_any:
+                print(
+                    f"[rank {rank}/{world_size}] TokenBudgetLimiter: stop (consumed≈{consumed} >= budget={self.token_budget})",
+                    file=sys.stderr,
+                )
                 break
             consumed += t
             yielded_any = True
             yield doc
             if consumed >= self.token_budget:
+                print(
+                    f"[rank {rank}/{world_size}] TokenBudgetLimiter: stop (consumed≈{consumed} >= budget={self.token_budget})",
+                    file=sys.stderr,
+                )
                 break
+
+
+class ProgressLogger(PipelineStep):
+    """
+    Periodically log progress from inside datatrove worker processes.
+
+    This is intentionally lightweight and stderr-only. It helps diagnose where a run "hangs":
+    - no progress logs => stuck before workers start (file discovery / planning)
+    - progress logs but low rate => CPU-bound adapter or slow IO
+    - progress logs stop suddenly => token budget hit or input exhausted
+    """
+
+    name = "📈 ProgressLogger"
+
+    def __init__(
+        self,
+        *,
+        dataset_name: str,
+        every_docs: int = 20000,
+        every_seconds: float = 30.0,
+        chars_per_token: float = 4.0,
+    ):
+        super().__init__()
+        self.dataset_name = str(dataset_name or "")
+        self.every_docs = int(every_docs)
+        self.every_seconds = float(every_seconds)
+        self.chars_per_token = float(chars_per_token)
+
+    def run(self, data, rank: int = 0, world_size: int = 1):  # noqa: ANN001
+        if self.every_docs <= 0 and self.every_seconds <= 0:
+            yield from data
+            return
+
+        t0 = time.monotonic()
+        last_t = t0
+        n = 0
+        last_n = 0
+        token_est = 0
+
+        def _maybe_log(force: bool = False) -> None:
+            nonlocal last_t, last_n
+            now = time.monotonic()
+            if not force:
+                if self.every_docs > 0 and (n - last_n) >= self.every_docs:
+                    pass
+                elif self.every_seconds > 0 and (now - last_t) >= self.every_seconds:
+                    pass
+                else:
+                    return
+
+            dt = max(now - t0, 1e-6)
+            dn = n - last_n
+            dts = max(now - last_t, 1e-6)
+            rate = dn / dts
+            total_rate = n / dt
+            tok = token_est
+            tok_s = tok / dt if tok > 0 else 0.0
+            print(
+                f"[rank {rank}/{world_size}] {self.dataset_name}: docs={n:,} "
+                f"rate={rate:,.1f}/s avg={total_rate:,.1f}/s"
+                + (f" tok≈{tok:,} tok/s≈{tok_s:,.1f}" if tok > 0 else ""),
+                file=sys.stderr,
+            )
+            last_t = now
+            last_n = n
+
+        # initial heartbeat so user knows ranks started
+        _maybe_log(force=True)
+        for doc in data:
+            n += 1
+            try:
+                text = getattr(doc, "text", "") or ""
+                if isinstance(text, str) and text:
+                    token_est += max(1, int(len(text) / max(self.chars_per_token, 1e-6)))
+            except Exception:
+                pass
+            _maybe_log(force=False)
+            yield doc
+
+        # final summary
+        _maybe_log(force=True)
 
 
 # -------------------------
@@ -535,6 +627,11 @@ def run_pipeline(
 
     blacklist_ids = _load_blacklist_ids(exclude_ids_dir)
 
+    def _stage(msg: str, *, dataset: str = "") -> None:
+        ds = f" {dataset}:" if dataset else ""
+        ts = time.strftime("%H:%M:%S")
+        print(f"[stage {ts}]{ds} {msg}", file=sys.stderr)
+
     class ExcludeIdsFilter(PipelineStep):
         """
         Drop documents whose id is present in `blacklist_ids`.
@@ -567,422 +664,460 @@ def run_pipeline(
                 yield doc
 
     def _run_one(cfg: dict) -> int:
-        ds = cfg.get("dataset", {})
-        name = (ds.get("name") or "").strip()
-        if not name:
-            return 0
-        if only and name != only:
-            return 0
-
-        # Per-config gating: only run configs that are explicitly enabled.
-        # Supported locations (first match wins):
-        # - top-level `enabled`
-        # - `dataset.enabled`
-        enabled = cfg.get("enabled", ds.get("enabled", True))
-        if enabled is not True:
-            print(f"[skip] {name}: disabled (enabled={enabled!r})", file=sys.stderr)
-            return 0
-
-        exec_cfg = cfg.get("executor") or {}
-
-        # Token-budget sampling is controlled via config (executor.*), with optional global overrides
-        # through the backend API (token_budget/token_budget_parallel/seed/chars_per_token).
-        #
-        # Supported keys:
-        # - executor.token_budget: int tokens
-        # - executor.token_billions: float B (converted to tokens via *1e9)
-        # - executor.token_budget_parallel: bool (split budget across tasks for more parallelism; approximate global budget)
-        # - executor.seed: int
-        # - executor.chars_per_token: float (tokens ~= len(text)/chars_per_token)
-        def _cfg_token_budget() -> int | None:
-            if token_budget is not None:
-                return int(token_budget)
-            if "token_budget" in exec_cfg:
-                try:
-                    return int(exec_cfg.get("token_budget"))
-                except Exception:
-                    return None
-            if "token_billions" in exec_cfg:
-                try:
-                    b = float(exec_cfg.get("token_billions"))
-                    return int(b * 1_000_000_000)
-                except Exception:
-                    return None
-            return None
-
-        eff_token_budget = _cfg_token_budget()
-        eff_token_budget_parallel = bool(exec_cfg.get("token_budget_parallel", token_budget_parallel))
-        eff_seed = int(exec_cfg.get("seed", seed))
-        eff_chars_per_token = float(exec_cfg.get("chars_per_token", chars_per_token))
-
-        adapter_kind = (cfg.get("adapter", {}) or {}).get("kind", "")
-        base_adapter = BASE_ADAPTERS.get(adapter_kind)
-        if not base_adapter:
-            print(f"[skip] {name}: unknown adapter kind {adapter_kind!r} ({cfg.get('_config_path')})", file=sys.stderr)
-            return 0
-        adapter_fn = make_adapter(
-            base_adapter,
-            name,
-            cfg.get("_config_path", ""),
-            system_ratio=float(system_ratio),
-            system_max_chars=int(system_max_chars),
-            seed=int(eff_seed),
-        )
-
-        source = pick_source(cfg, datasets_root)
-        if not source:
-            print(f"[skip] {name}: no usable source found (paths missing or deps missing)", file=sys.stderr)
-            return 0
-
-        def _get_path_keywords(src: dict) -> list[str]:
-            """
-            Optional file/folder keyword filter:
-            Only keep files whose *relative path under data_dir* contains any of these substrings.
-
-            Config keys supported:
-            - source.path_keywords: ["low", "part00"] (list)
-            - source.path_keyword: "low" (single string)
-            - source.include_keywords: ["..."] (alias)
-            """
-            kws = src.get("path_keywords", src.get("include_keywords", []))
-            if isinstance(kws, str):
-                kws = [kws]
-            if not isinstance(kws, list):
-                kws = []
-            if isinstance(src.get("path_keyword"), str) and src.get("path_keyword").strip():
-                kws = list(kws) + [src.get("path_keyword")]
-            out: list[str] = []
-            for k in kws:
-                s = str(k).strip()
-                if s:
-                    out.append(s)
-            # de-dupe, stable
-            seen = set()
-            dedup: list[str] = []
-            for k in out:
-                if k not in seen:
-                    seen.add(k)
-                    dedup.append(k)
-            return dedup
-
-        path_keywords = _get_path_keywords(source)
-
-        def _kw_match(rel_posix: str) -> bool:
-            if not path_keywords:
-                return True
-            rp = str(rel_posix)
-            return any(k in rp for k in path_keywords)
-        if eff_token_budget:
-            # enable file-level shuffling to make early-stop sampling less biased
-            source = dict(source)
-            source["_shuffle_files"] = True
-
-        # Support multi-glob sources via a generated paths file (union of patterns).
-        paths_file: str | None = None
-        globs = source.get("globs") or []
-        if not isinstance(globs, list):
-            globs = []
-        globs = [str(g).strip() for g in globs if str(g).strip()]
-        if globs:
-            base = datasets_root / source["data_dir"]
-            rel_paths: list[str] = []
-            for g in globs:
-                for p in base.glob(g):
-                    if p.is_file():
-                        rp = p.relative_to(base).as_posix()
-                        if _kw_match(rp):
-                            rel_paths.append(rp)
-            rel_paths = sorted(set(rel_paths))
-            if not rel_paths:
-                print(f"[skip] {name}: globs matched 0 files under {base}", file=sys.stderr)
+        """
+        Run one dataset config end-to-end, with verbose stage logging and full tracebacks on errors.
+        """
+        name = "<unknown>"
+        try:
+            ds = cfg.get("dataset", {})
+            name = (ds.get("name") or "").strip() or name
+            if name == "<unknown>":
                 return 0
-            paths_file_path = (out_root / "_paths" / name / "paths.txt")
-            paths_file_path.parent.mkdir(parents=True, exist_ok=True)
-            paths_file_path.write_text("\n".join(rel_paths) + "\n", encoding="utf-8")
-            paths_file = str(paths_file_path)
-        elif path_keywords:
-            # Single-glob keyword filtering: generate a paths file so readers only see the filtered subset.
-            base = datasets_root / source["data_dir"]
-            pattern = (source.get("glob") or "").strip()
-            rel_paths = []
-            if pattern:
-                for p in base.glob(pattern):
-                    if p.is_file():
-                        rp = p.relative_to(base).as_posix()
-                        if _kw_match(rp):
-                            rel_paths.append(rp)
-            rel_paths = sorted(set(rel_paths))
-            if not rel_paths:
-                print(f"[skip] {name}: keyword filter matched 0 files under {base} (keywords={path_keywords})", file=sys.stderr)
+            if only and name != only:
                 return 0
-            paths_file_path = (out_root / "_paths" / name / "paths.txt")
-            paths_file_path.parent.mkdir(parents=True, exist_ok=True)
-            paths_file_path.write_text("\n".join(rel_paths) + "\n", encoding="utf-8")
-            paths_file = str(paths_file_path)
 
-        reader = build_reader(source, datasets_root, adapter_fn, paths_file=paths_file)
-        if limit != -1:
-            reader.limit = limit
+            _stage(f"start (config={cfg.get('_config_path','')})", dataset=name)
 
-        ds_out = out_root / name
-        logs_dir = out_root / "_logs" / name
-        ds_out.mkdir(parents=True, exist_ok=True)
-        logs_dir.mkdir(parents=True, exist_ok=True)
+            enabled = cfg.get("enabled", ds.get("enabled", True))
+            if enabled is not True:
+                print(f"[skip] {name}: disabled (enabled={enabled!r})", file=sys.stderr)
+                return 0
 
-        base = datasets_root / source["data_dir"]
-        pattern = (source.get("glob") or "").strip()
-        globs_for_stats = source.get("globs") or []
-        if not isinstance(globs_for_stats, list):
-            globs_for_stats = []
-        globs_for_stats = [str(g).strip() for g in globs_for_stats if str(g).strip()]
+            exec_cfg = cfg.get("executor") or {}
 
-        if globs_for_stats:
-            matched_files = []
-            for g in globs_for_stats:
-                matched_files.extend([p for p in base.glob(g) if p.is_file()])
-        else:
-            matched_files = [p for p in base.glob(pattern) if p.is_file()] if pattern else []
-        if path_keywords:
-            matched_files = [p for p in matched_files if _kw_match(p.relative_to(base).as_posix())]
-        file_count = len(matched_files)
-        total_bytes = 0
-        for p in matched_files:
-            try:
-                total_bytes += p.stat().st_size
-            except Exception:
-                pass
-
-        def _estimate_jsonl_file_tokens(p: Path, *, sample_lines: int = 200) -> float | None:
-            """
-            Estimate tokens for a JSONL file by sampling a few lines and extrapolating.
-            This is used as a guardrail to avoid per-task token budget truncating a single huge file when tasks>1.
-            Returns None if the file can't be sampled.
-            """
-            try:
-                size_bytes = p.stat().st_size
-            except Exception:
-                return None
-            if size_bytes <= 0:
-                return 0.0
-            n = 0
-            bytes_sum = 0
-            text_chars_sum = 0
-            try:
-                with p.open("rb") as f:
-                    for li in range(int(sample_lines)):
-                        line_b = f.readline()
-                        if not line_b:
-                            break
-                        b = line_b.strip()
-                        if not b:
-                            continue
-                        bytes_sum += len(line_b)
-                        try:
-                            obj = json.loads(b.decode("utf-8", errors="replace"))
-                        except Exception:
-                            continue
-                        if not isinstance(obj, dict):
-                            obj = {"value": obj}
-                        try:
-                            doc = base_adapter(None, obj, p.as_posix(), li)  # type: ignore[arg-type]
-                        except Exception:
-                            continue
-                        t = doc.get("text") if isinstance(doc, dict) else ""
-                        if isinstance(t, str):
-                            text_chars_sum += len(t)
-                        n += 1
-            except Exception:
+            # --- token budget (config-driven) ---
+            def _cfg_token_budget() -> int | None:
+                if token_budget is not None:
+                    return int(token_budget)
+                if "token_budget" in exec_cfg:
+                    try:
+                        return int(exec_cfg.get("token_budget"))
+                    except Exception:
+                        return None
+                if "token_billions" in exec_cfg:
+                    try:
+                        b = float(exec_cfg.get("token_billions"))
+                        return int(b * 1_000_000_000)
+                    except Exception:
+                        return None
                 return None
 
-            if n <= 0 or bytes_sum <= 0:
-                return None
-            avg_bytes_per_line = bytes_sum / n
-            est_lines = max(1.0, float(size_bytes) / max(avg_bytes_per_line, 1e-6))
-            avg_text_chars = text_chars_sum / n
-            est_chars = est_lines * avg_text_chars
-            return est_chars / max(eff_chars_per_token, 1e-6)
+            eff_token_budget = _cfg_token_budget()
+            eff_token_budget_parallel = bool(exec_cfg.get("token_budget_parallel", token_budget_parallel))
+            eff_seed = int(exec_cfg.get("seed", seed))
+            eff_chars_per_token = float(exec_cfg.get("chars_per_token", chars_per_token))
 
-        # Output splitting: aim for ~10–15MB per output file by rolling writer files.
-        # NOTE: this is the only way to get ~1000 output files from a dataset with few large input files
-        # (tasks can never exceed the number of input files for disk readers).
-        # Default rolling shard sizing:
-        # - enable splitting when total input is >= ~2MB
-        # - target output file size around ~2MB
-        # (can be overridden per-dataset via config.executor.{min_shard_mb,target_shard_mb})
-        min_mb = float(exec_cfg.get("min_shard_mb", exec_cfg.get("min_mb", 2)))
-        target_mb = float(exec_cfg.get("target_shard_mb", exec_cfg.get("target_mb", 2)))
-        min_bytes = int(min_mb * 1024 * 1024)
-        target_bytes = max(int(target_mb * 1024 * 1024), 1)
-        writer_max_file_size = -1 if total_bytes < min_bytes else target_bytes
+            # --- adapter ---
+            adapter_kind = (cfg.get("adapter", {}) or {}).get("kind", "")
+            base_adapter = BASE_ADAPTERS.get(adapter_kind)
+            if not base_adapter:
+                print(
+                    f"[skip] {name}: unknown adapter kind {adapter_kind!r} ({cfg.get('_config_path')})",
+                    file=sys.stderr,
+                )
+                return 0
+            adapter_fn = make_adapter(
+                base_adapter,
+                name,
+                cfg.get("_config_path", ""),
+                system_ratio=float(system_ratio),
+                system_max_chars=int(system_max_chars),
+                seed=int(eff_seed),
+            )
+            _stage(
+                f"adapter={adapter_kind} system_ratio={float(system_ratio)} system_max_chars={int(system_max_chars)} seed={eff_seed}",
+                dataset=name,
+            )
 
-        if tasks_override is not None:
-            tasks = int(tasks_override)
-        elif "tasks" in exec_cfg:
-            tasks = int(exec_cfg.get("tasks", 20))
-        else:
-            # Default parallelism:
-            # - If token budget sampling is enabled, default is tasks=1 for the closest-to-true global budget.
-            # - If token_budget_parallel is enabled, we allow parallel tasks (budget will be split across tasks).
-            if eff_token_budget and not eff_token_budget_parallel:
-                tasks = 1
-            else:
-                # If input is small, don't bother splitting into multiple ranks/tasks.
-                if total_bytes < min_bytes or file_count <= 1:
-                    tasks = 1
-                else:
-                    # Default parallelism: cap to number of files to avoid empty ranks.
-                    default_tasks = int(exec_cfg.get("default_tasks", 20))
-                    tasks = max(1, min(file_count, default_tasks))
+            # --- source selection ---
+            source = pick_source(cfg, datasets_root)
+            if not source:
+                print(f"[skip] {name}: no usable source found (paths missing or deps missing)", file=sys.stderr)
+                return 0
+            _stage(
+                f"source picked type={source.get('type')} data_dir={source.get('data_dir')} "
+                f"glob={source.get('glob','')} globs={len(source.get('globs') or [])}",
+                dataset=name,
+            )
 
-        # Guardrail: for disk readers, tasks beyond number of input files just creates idle ranks.
-        # This is especially common on smaller machines where users set -j very high.
-        if file_count > 0 and tasks > file_count:
-            print(f"[warn] {name}: tasks={tasks} > input_files={file_count}; capping tasks to {file_count}", file=sys.stderr)
-            tasks = file_count
+            def _get_path_keywords(src: dict) -> list[str]:
+                """
+                Optional file/folder keyword filter:
+                Only keep files whose *relative path under data_dir* contains any of these substrings.
 
-        # Guardrail: when running with a per-task token budget (token_budget + tasks>1),
-        # a single huge input file can be assigned to a single rank, causing that file to be truncated.
-        # For JSONL sources, estimate the largest file and cap tasks so per-rank budget can cover it.
-        if eff_token_budget and tasks > 1 and source.get("type") == "jsonl":
-            # per-rank budget is split when tasks>1
-            per_rank_budget = max(1, (int(eff_token_budget) + tasks - 1) // tasks)
-            est_max_file_tokens = 0.0
-            # sample only a handful of largest files for speed
-            for p in sorted(matched_files, key=lambda x: getattr(x.stat(), "st_size", 0), reverse=True)[:5]:
-                est = _estimate_jsonl_file_tokens(p)
-                if est is not None:
-                    est_max_file_tokens = max(est_max_file_tokens, float(est))
-            if est_max_file_tokens > 0 and per_rank_budget < est_max_file_tokens:
-                # compute max tasks allowed to avoid truncating the largest file
-                max_tasks_no_trunc = max(1, int(int(eff_token_budget) // int(max(est_max_file_tokens, 1))))
-                if max_tasks_no_trunc < tasks:
+                Config keys supported:
+                - source.path_keywords: ["low", "part00"] (list)
+                - source.path_keyword: "low" (single string)
+                - source.include_keywords: ["..."] (alias)
+                """
+                kws = src.get("path_keywords", src.get("include_keywords", []))
+                if isinstance(kws, str):
+                    kws = [kws]
+                if not isinstance(kws, list):
+                    kws = []
+                if isinstance(src.get("path_keyword"), str) and src.get("path_keyword").strip():
+                    kws = list(kws) + [src.get("path_keyword")]
+                out: list[str] = []
+                for k in kws:
+                    s = str(k).strip()
+                    if s:
+                        out.append(s)
+                # de-dupe, stable
+                seen = set()
+                dedup: list[str] = []
+                for k in out:
+                    if k not in seen:
+                        seen.add(k)
+                        dedup.append(k)
+                return dedup
+
+            path_keywords = _get_path_keywords(source)
+
+            def _kw_match(rel_posix: str) -> bool:
+                if not path_keywords:
+                    return True
+                rp = str(rel_posix)
+                return any(k in rp for k in path_keywords)
+
+            if eff_token_budget:
+                # enable file-level shuffling to make early-stop sampling less biased
+                source = dict(source)
+                source["_shuffle_files"] = True
+
+            # --- build paths_file if needed (multi-glob or keyword filter) ---
+            paths_file: str | None = None
+            globs = source.get("globs") or []
+            if not isinstance(globs, list):
+                globs = []
+            globs = [str(g).strip() for g in globs if str(g).strip()]
+
+            if globs:
+                base = datasets_root / source["data_dir"]
+                rel_paths: list[str] = []
+                for g in globs:
+                    for p in base.glob(g):
+                        if p.is_file():
+                            rp = p.relative_to(base).as_posix()
+                            if _kw_match(rp):
+                                rel_paths.append(rp)
+                rel_paths = sorted(set(rel_paths))
+                if not rel_paths:
+                    print(f"[skip] {name}: globs matched 0 files under {base}", file=sys.stderr)
+                    return 0
+                paths_file_path = out_root / "_paths" / name / "paths.txt"
+                paths_file_path.parent.mkdir(parents=True, exist_ok=True)
+                paths_file_path.write_text("\n".join(rel_paths) + "\n", encoding="utf-8")
+                paths_file = str(paths_file_path)
+                _stage(f"paths_file generated (globs union): {len(rel_paths)} file(s)", dataset=name)
+            elif path_keywords:
+                base = datasets_root / source["data_dir"]
+                pattern = (source.get("glob") or "").strip()
+                rel_paths: list[str] = []
+                if pattern:
+                    for p in base.glob(pattern):
+                        if p.is_file():
+                            rp = p.relative_to(base).as_posix()
+                            if _kw_match(rp):
+                                rel_paths.append(rp)
+                rel_paths = sorted(set(rel_paths))
+                if not rel_paths:
                     print(
-                        f"[warn] {name}: token_budget split across tasks would truncate a large JSONL file "
-                        f"(per_rank_budget≈{per_rank_budget}, est_max_file_tokens≈{int(est_max_file_tokens)}). "
-                        f"Capping tasks {tasks} -> {max_tasks_no_trunc} to avoid truncation. "
-                        f"(Tip: to keep higher parallelism, pre-shard the large JSONL into multiple files.)",
+                        f"[skip] {name}: keyword filter matched 0 files under {base} (keywords={path_keywords})",
                         file=sys.stderr,
                     )
-                    tasks = max_tasks_no_trunc
+                    return 0
+                paths_file_path = out_root / "_paths" / name / "paths.txt"
+                paths_file_path.parent.mkdir(parents=True, exist_ok=True)
+                paths_file_path.write_text("\n".join(rel_paths) + "\n", encoding="utf-8")
+                paths_file = str(paths_file_path)
+                _stage(f"paths_file generated (keyword filter {path_keywords}): {len(rel_paths)} file(s)", dataset=name)
 
-        workers = int(workers_override) if workers_override is not None else int(exec_cfg.get("workers", 8))
-        workers = max(1, min(workers, tasks))
-        tasks = max(1, tasks)
+            # --- reader ---
+            reader = build_reader(source, datasets_root, adapter_fn, paths_file=paths_file)
+            if limit != -1:
+                reader.limit = limit
 
-        output_filename = "${rank}.jsonl" if not compression else "${rank}.jsonl.gz"
-        pipeline = [reader]
-        if blacklist_ids:
-            pipeline.append(ExcludeIdsFilter(blacklist_ids, dataset_name=name, mixed=bool(mixed_name)))
-        if eff_token_budget:
-            # NOTE: TokenBudgetLimiter is per-rank. We treat `token_budget` as a desired *global* budget.
-            # - tasks=1: closest to a true global budget
-            # - tasks>1: approximate by splitting the budget across tasks (may still slightly overshoot)
-            per_rank_budget = int(eff_token_budget)
-            if tasks > 1:
-                per_rank_budget = max(1, (int(eff_token_budget) + tasks - 1) // tasks)
-            pipeline.append(TokenBudgetLimiter(per_rank_budget, seed=eff_seed, chars_per_token=eff_chars_per_token))
+            ds_out = out_root / name
+            logs_dir = out_root / "_logs" / name
+            ds_out.mkdir(parents=True, exist_ok=True)
+            logs_dir.mkdir(parents=True, exist_ok=True)
 
-        # Main output: full Document dict (includes metadata/raw)
-        if not prepare_only and not mixed_name:
-            pipeline.append(
-                StdJsonlWriter(
-                    str(ds_out),
-                    output_filename=output_filename,
-                    compression=compression,
-                    max_file_size=writer_max_file_size,
-                )
-            )
+            # --- scan files for stats / planning ---
+            base = datasets_root / source["data_dir"]
+            pattern = (source.get("glob") or "").strip()
+            globs_for_stats = source.get("globs") or []
+            if not isinstance(globs_for_stats, list):
+                globs_for_stats = []
+            globs_for_stats = [str(g).strip() for g in globs_for_stats if str(g).strip()]
 
-        # Prepare output: CPT-friendly lightweight view (uuid + text only)
-        if prepare or mixed_name:
-            # In mixed mode, write all datasets into a single folder under <out-root>/mixed/<mixed_name>/.
-            # We keep prepare schema {uuid,text} and prefix uuid with '<dataset>::' to avoid collisions.
-            if mixed_name:
-                prepare_out = out_root / "mixed" / mixed_name
+            t_scan0 = time.monotonic()
+            if globs_for_stats:
+                matched_files: list[Path] = []
+                for g in globs_for_stats:
+                    matched_files.extend([p for p in base.glob(g) if p.is_file()])
             else:
-                prepare_out = out_root / "prepare" / name
-            prepare_out.mkdir(parents=True, exist_ok=True)
+                matched_files = [p for p in base.glob(pattern) if p.is_file()] if pattern else []
+            if path_keywords:
+                matched_files = [p for p in matched_files if _kw_match(p.relative_to(base).as_posix())]
 
-            def _prepare_adapter(self, document):  # noqa: ANN001
-                uid = str(getattr(document, "id", ""))
-                if mixed_name:
-                    uid = f"{name}::{uid}"
-                return {"uuid": uid, "text": getattr(document, "text", "")}
-
-            prepare_filename = f"{name}__${{rank}}.jsonl" if mixed_name else "${rank}.jsonl"
-            pipeline.append(
-                StdJsonlWriter(
-                    str(prepare_out),
-                    output_filename=prepare_filename,
-                    compression=None,
-                    adapter=_prepare_adapter,
-                    max_file_size=writer_max_file_size,
-                )
-            )
-
-        def _has_any_jsonl(folder: Path) -> bool:
-            if not folder.exists():
-                return False
-            # includes rolling shards like 000_00000.jsonl and plain 00000.jsonl
-            return any(folder.glob("*.jsonl")) or any(folder.glob("*.jsonl.gz")) or any(folder.glob("*.jsonl.*"))
-
-        # Force / resume guard:
-        # Datatrove will skip tasks if it thinks they are completed based on logs_dir state.
-        # If outputs were deleted (or output mode changed, e.g. switching to --prepare-only),
-        # we must also clear logs_dir to force a re-run.
-        required_dirs: list[Path] = []
-        if mixed_name:
-            required_dirs.append(out_root / "mixed" / mixed_name)
-        elif prepare:
-            required_dirs.append(out_root / "prepare" / name)
-        if not prepare_only:
-            required_dirs.append(ds_out)
-
-        outputs_ok = True
-        for d in required_dirs:
-            if not _has_any_jsonl(d):
-                outputs_ok = False
-                break
-
-        if force:
-            print(f"[force] {name}: deleting {logs_dir} and existing outputs", file=sys.stderr)
-            try:
-                shutil.rmtree(logs_dir, ignore_errors=True)
-            except Exception:
-                pass
-            for d in required_dirs:
+            file_count = len(matched_files)
+            total_bytes = 0
+            for p in matched_files:
                 try:
-                    shutil.rmtree(d, ignore_errors=True)
+                    total_bytes += p.stat().st_size
                 except Exception:
                     pass
-            logs_dir.mkdir(parents=True, exist_ok=True)
-            if prepare:
-                (out_root / "prepare" / name).mkdir(parents=True, exist_ok=True)
+            scan_ms = int((time.monotonic() - t_scan0) * 1000)
+            if scan_ms >= 1500:
+                print(
+                    f"[info] {name}: file discovery took {scan_ms}ms (files={file_count}, base={base}, pattern={pattern or globs_for_stats})",
+                    file=sys.stderr,
+                )
+
+            def _estimate_jsonl_file_tokens(p: Path, *, sample_lines: int = 200) -> float | None:
+                """
+                Estimate tokens for a JSONL file by sampling a few lines and extrapolating.
+                Used as a guardrail to avoid per-task token budget truncating a single huge file when tasks>1.
+                """
+                try:
+                    size_bytes = p.stat().st_size
+                except Exception:
+                    return None
+                if size_bytes <= 0:
+                    return 0.0
+                n = 0
+                bytes_sum = 0
+                text_chars_sum = 0
+                try:
+                    with p.open("rb") as f:
+                        for li in range(int(sample_lines)):
+                            line_b = f.readline()
+                            if not line_b:
+                                break
+                            b = line_b.strip()
+                            if not b:
+                                continue
+                            bytes_sum += len(line_b)
+                            try:
+                                obj = json.loads(b.decode("utf-8", errors="replace"))
+                            except Exception:
+                                continue
+                            if not isinstance(obj, dict):
+                                obj = {"value": obj}
+                            try:
+                                doc = base_adapter(None, obj, p.as_posix(), li)  # type: ignore[arg-type]
+                            except Exception:
+                                continue
+                            t = doc.get("text") if isinstance(doc, dict) else ""
+                            if isinstance(t, str):
+                                text_chars_sum += len(t)
+                            n += 1
+                except Exception:
+                    return None
+
+                if n <= 0 or bytes_sum <= 0:
+                    return None
+                avg_bytes_per_line = bytes_sum / n
+                est_lines = max(1.0, float(size_bytes) / max(avg_bytes_per_line, 1e-6))
+                avg_text_chars = text_chars_sum / n
+                est_chars = est_lines * avg_text_chars
+                return est_chars / max(eff_chars_per_token, 1e-6)
+
+            # --- output file rolling ---
+            min_mb = float(exec_cfg.get("min_shard_mb", exec_cfg.get("min_mb", 2)))
+            target_mb = float(exec_cfg.get("target_shard_mb", exec_cfg.get("target_mb", 2)))
+            min_bytes = int(min_mb * 1024 * 1024)
+            target_bytes = max(int(target_mb * 1024 * 1024), 1)
+            writer_max_file_size = -1 if total_bytes < min_bytes else target_bytes
+
+            # --- tasks/workers planning ---
+            if tasks_override is not None:
+                tasks = int(tasks_override)
+            elif "tasks" in exec_cfg:
+                tasks = int(exec_cfg.get("tasks", 20))
+            else:
+                if eff_token_budget and not eff_token_budget_parallel:
+                    tasks = 1
+                else:
+                    if total_bytes < min_bytes or file_count <= 1:
+                        tasks = 1
+                    else:
+                        default_tasks = int(exec_cfg.get("default_tasks", 20))
+                        tasks = max(1, min(file_count, default_tasks))
+
+            if file_count > 0 and tasks > file_count:
+                print(f"[warn] {name}: tasks={tasks} > input_files={file_count}; capping tasks to {file_count}", file=sys.stderr)
+                tasks = file_count
+
+            if eff_token_budget and tasks > 1 and source.get("type") == "jsonl":
+                per_rank_budget = max(1, (int(eff_token_budget) + tasks - 1) // tasks)
+                est_max_file_tokens = 0.0
+                for p in sorted(matched_files, key=lambda x: getattr(x.stat(), "st_size", 0), reverse=True)[:5]:
+                    est = _estimate_jsonl_file_tokens(p)
+                    if est is not None:
+                        est_max_file_tokens = max(est_max_file_tokens, float(est))
+                if est_max_file_tokens > 0 and per_rank_budget < est_max_file_tokens:
+                    max_tasks_no_trunc = max(1, int(int(eff_token_budget) // int(max(est_max_file_tokens, 1))))
+                    if max_tasks_no_trunc < tasks:
+                        print(
+                            f"[warn] {name}: token_budget split across tasks would truncate a large JSONL file "
+                            f"(per_rank_budget≈{per_rank_budget}, est_max_file_tokens≈{int(est_max_file_tokens)}). "
+                            f"Capping tasks {tasks} -> {max_tasks_no_trunc} to avoid truncation. "
+                            f"(Tip: to keep higher parallelism, pre-shard the large JSONL into multiple files.)",
+                            file=sys.stderr,
+                        )
+                        tasks = max_tasks_no_trunc
+
+            workers = int(workers_override) if workers_override is not None else int(exec_cfg.get("workers", 8))
+            workers = max(1, min(workers, tasks))
+            tasks = max(1, tasks)
+
+            # --- pipeline ---
+            output_filename = "${rank}.jsonl" if not compression else "${rank}.jsonl.gz"
+            pipeline: list = [reader]
+            if blacklist_ids:
+                pipeline.append(ExcludeIdsFilter(blacklist_ids, dataset_name=name, mixed=bool(mixed_name)))
+            if eff_token_budget:
+                per_rank_budget = int(eff_token_budget)
+                if tasks > 1:
+                    per_rank_budget = max(1, (int(eff_token_budget) + tasks - 1) // tasks)
+                pipeline.append(TokenBudgetLimiter(per_rank_budget, seed=eff_seed, chars_per_token=eff_chars_per_token))
+
+            progress_cfg = exec_cfg.get("progress") or {}
+            if not isinstance(progress_cfg, dict):
+                progress_cfg = {}
+            every_docs = int(progress_cfg.get("every_docs", exec_cfg.get("log_every_docs", 20000)))
+            every_seconds = float(progress_cfg.get("every_seconds", exec_cfg.get("log_every_seconds", 30.0)))
+            if every_docs > 0 or every_seconds > 0:
+                pipeline.append(
+                    ProgressLogger(
+                        dataset_name=name,
+                        every_docs=every_docs,
+                        every_seconds=every_seconds,
+                        chars_per_token=eff_chars_per_token,
+                    )
+                )
+
+            if not prepare_only and not mixed_name:
+                pipeline.append(
+                    StdJsonlWriter(
+                        str(ds_out),
+                        output_filename=output_filename,
+                        compression=compression,
+                        max_file_size=writer_max_file_size,
+                    )
+                )
+
+            if prepare or mixed_name:
+                if mixed_name:
+                    prepare_out = out_root / "mixed" / mixed_name
+                else:
+                    prepare_out = out_root / "prepare" / name
+                prepare_out.mkdir(parents=True, exist_ok=True)
+
+                def _prepare_adapter(self, document):  # noqa: ANN001
+                    uid = str(getattr(document, "id", ""))
+                    if mixed_name:
+                        uid = f"{name}::{uid}"
+                    return {"uuid": uid, "text": getattr(document, "text", "")}
+
+                prepare_filename = f"{name}__${{rank}}.jsonl" if mixed_name else "${rank}.jsonl"
+                pipeline.append(
+                    StdJsonlWriter(
+                        str(prepare_out),
+                        output_filename=prepare_filename,
+                        compression=None,
+                        adapter=_prepare_adapter,
+                        max_file_size=writer_max_file_size,
+                    )
+                )
+
+            def _has_any_jsonl(folder: Path) -> bool:
+                if not folder.exists():
+                    return False
+                return any(folder.glob("*.jsonl")) or any(folder.glob("*.jsonl.gz")) or any(folder.glob("*.jsonl.*"))
+
+            required_dirs: list[Path] = []
+            if mixed_name:
+                required_dirs.append(out_root / "mixed" / mixed_name)
+            elif prepare:
+                required_dirs.append(out_root / "prepare" / name)
             if not prepare_only:
-                ds_out.mkdir(parents=True, exist_ok=True)
-        else:
-            # If logs exist but outputs are missing, clear logs to avoid "already completed" no-op runs.
-            if logs_dir.exists() and not outputs_ok:
-                print(f"[warn] {name}: outputs missing but logs exist; clearing {logs_dir} to re-run", file=sys.stderr)
+                required_dirs.append(ds_out)
+
+            outputs_ok = True
+            for d in required_dirs:
+                if not _has_any_jsonl(d):
+                    outputs_ok = False
+                    break
+
+            if force:
+                print(f"[force] {name}: deleting {logs_dir} and existing outputs", file=sys.stderr)
                 try:
                     shutil.rmtree(logs_dir, ignore_errors=True)
                 except Exception:
                     pass
+                for d in required_dirs:
+                    try:
+                        shutil.rmtree(d, ignore_errors=True)
+                    except Exception:
+                        pass
                 logs_dir.mkdir(parents=True, exist_ok=True)
+                if prepare:
+                    (out_root / "prepare" / name).mkdir(parents=True, exist_ok=True)
+                if not prepare_only:
+                    ds_out.mkdir(parents=True, exist_ok=True)
+            else:
+                if logs_dir.exists() and not outputs_ok:
+                    print(f"[warn] {name}: outputs missing but logs exist; clearing {logs_dir} to re-run", file=sys.stderr)
+                    try:
+                        shutil.rmtree(logs_dir, ignore_errors=True)
+                    except Exception:
+                        pass
+                    logs_dir.mkdir(parents=True, exist_ok=True)
 
-        glob_desc = pattern if pattern else (";".join(globs_for_stats) if globs_for_stats else "")
-        tb = f"{eff_token_budget}" if eff_token_budget else "0"
-        tb_mode = "split" if (eff_token_budget and tasks > 1) else ("global" if eff_token_budget else "off")
-        out_mode = (f"mixed:{mixed_name}" if mixed_name else ("prepare-only" if prepare_only else ("prepare+full" if prepare else "full")))
-        total_mb_str = f"{(total_bytes / (1024 * 1024)):.1f}MB" if total_bytes else "0MB"
-        print(
-            f"[run] {name} source={source['type']} dir={source['data_dir']} glob={glob_desc} "
-            f"files={file_count} size={total_mb_str} tasks={tasks} workers={workers} token_budget={tb}({tb_mode}) out={out_mode}",
-            file=sys.stderr,
-        )
-        LocalPipelineExecutor(pipeline=pipeline, logging_dir=str(logs_dir), tasks=tasks, workers=workers).run()
-        print(f"[ok] {name} -> {ds_out}", file=sys.stderr)
-        return 0
+            glob_desc = pattern if pattern else (";".join(globs_for_stats) if globs_for_stats else "")
+            tb = f"{eff_token_budget}" if eff_token_budget else "0"
+            tb_mode = "split" if (eff_token_budget and tasks > 1) else ("global" if eff_token_budget else "off")
+            out_mode = (
+                f"mixed:{mixed_name}"
+                if mixed_name
+                else ("prepare-only" if prepare_only else ("prepare+full" if prepare else "full"))
+            )
+            total_mb_str = f"{(total_bytes / (1024 * 1024)):.1f}MB" if total_bytes else "0MB"
+            print(
+                f"[run] {name} source={source['type']} dir={source['data_dir']} glob={glob_desc} "
+                f"files={file_count} size={total_mb_str} tasks={tasks} workers={workers} token_budget={tb}({tb_mode}) out={out_mode}",
+                file=sys.stderr,
+            )
+
+            # Heartbeat from the main process in case worker processes never start / never print.
+            hb_sec = float(exec_cfg.get("heartbeat_seconds", 120.0))
+            hb_stop = threading.Event()
+
+            def _hb() -> None:
+                if hb_sec <= 0:
+                    return
+                t0 = time.monotonic()
+                while not hb_stop.wait(timeout=hb_sec):
+                    dt = time.monotonic() - t0
+                    print(f"[hb] {name}: still running (elapsed={dt:.0f}s)", file=sys.stderr)
+
+            threading.Thread(target=_hb, daemon=True).start()
+
+            _stage("executor starting (LocalPipelineExecutor.run)", dataset=name)
+            t_exec0 = time.monotonic()
+            LocalPipelineExecutor(pipeline=pipeline, logging_dir=str(logs_dir), tasks=tasks, workers=workers).run()
+            hb_stop.set()
+            dur_s = time.monotonic() - t_exec0
+            if dur_s >= 1.0:
+                print(f"[done] {name}: executor finished in {dur_s:.1f}s", file=sys.stderr)
+            print(f"[ok] {name} -> {ds_out}", file=sys.stderr)
+            return 0
+        except Exception:
+            print(f"[error] {name}: crashed inside UDatasets backend", file=sys.stderr)
+            print(traceback.format_exc(), file=sys.stderr)
+            return 1
 
     dataset_parallelism = max(1, int(dataset_parallelism))
     if dataset_parallelism == 1:
@@ -1024,8 +1159,9 @@ def run_pipeline(
             name = fut_to_name[fut]
             try:
                 rc = int(fut.result())
-            except Exception as e:
-                print(f"[error] {name}: crashed ({e})", file=sys.stderr)
+            except Exception:
+                print(f"[error] {name}: crashed (dataset thread)", file=sys.stderr)
+                print(traceback.format_exc(), file=sys.stderr)
                 first_err = first_err or 1
                 continue
             if rc != 0:
