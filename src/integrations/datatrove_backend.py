@@ -18,7 +18,7 @@ import random
 import time
 import traceback
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from typing import Callable, Dict, IO, Literal
 
 
@@ -62,6 +62,124 @@ from datatrove.utils.logging import logger  # noqa: E402  # type: ignore[import-
 from pipelines.dataset_adapters import BASE_ADAPTERS  # noqa: E402
 from pipelines.dataset_configs import load_configs, pick_source  # noqa: E402
 from utils.json_stream import iter_json_array_stream  # noqa: E402
+
+
+# -------------------------
+# Exclude-ids helpers (module-level so they can be pickled for ProcessPoolExecutor)
+# -------------------------
+
+
+def _exclude_ids_extract_json_string_field(line: str, key: str, scan_limit: int) -> str | None:
+    """
+    Fast-path extractor for JSONL lines that are dict-like JSON objects.
+
+    We only scan the head (scan_limit) to avoid spending time scanning huge "text" tails.
+    Supports basic JSON escapes inside the string value.
+    """
+    if not line or line[0] != "{":
+        return None
+    needle = f"\"{key}\""
+    head = line if len(line) <= scan_limit else line[:scan_limit]
+    i = head.find(needle)
+    if i < 0:
+        return None
+    i += len(needle)
+    n = len(line)
+    while i < n and line[i].isspace():
+        i += 1
+    if i >= n or line[i] != ":":
+        return None
+    i += 1
+    while i < n and line[i].isspace():
+        i += 1
+    if i >= n or line[i] != "\"":
+        return None
+    i += 1
+    out_chars: list[str] = []
+    while i < n:
+        c = line[i]
+        if c == "\"":
+            return "".join(out_chars)
+        if c == "\\":
+            i += 1
+            if i >= n:
+                return None
+            esc = line[i]
+            if esc in ("\\", "\"", "/"):
+                out_chars.append(esc)
+            elif esc == "b":
+                out_chars.append("\b")
+            elif esc == "f":
+                out_chars.append("\f")
+            elif esc == "n":
+                out_chars.append("\n")
+            elif esc == "r":
+                out_chars.append("\r")
+            elif esc == "t":
+                out_chars.append("\t")
+            elif esc == "u":
+                if i + 4 >= n:
+                    return None
+                hexs = line[i + 1 : i + 5]
+                try:
+                    out_chars.append(chr(int(hexs, 16)))
+                except Exception:
+                    return None
+                i += 4
+            else:
+                return None
+        else:
+            out_chars.append(c)
+        i += 1
+    return None
+
+
+def _exclude_ids_scan_jsonl_range_to_file(
+    path: str, start: int, end: int, scan_limit: int, out_path: str
+) -> tuple[int, int]:
+    """
+    Scan a byte-range of a JSONL file and write extracted ids to `out_path` (one per line).
+    Returns (lines_seen, ids_written).
+    """
+    out: set[str] = set()
+    lines_seen = 0
+    try:
+        with open(path, "rt", encoding="utf-8", errors="replace") as f:
+            f.seek(max(0, int(start)))
+            if start > 0:
+                f.readline()
+            while True:
+                pos = f.tell()
+                if pos >= end:
+                    break
+                line = f.readline()
+                if not line:
+                    break
+                s = line.strip()
+                if not s:
+                    continue
+                lines_seen += 1
+                if not s.startswith("{"):
+                    out.add(s)
+                    continue
+                uid = (
+                    _exclude_ids_extract_json_string_field(s, "uuid", scan_limit)
+                    or _exclude_ids_extract_json_string_field(s, "id", scan_limit)
+                    or _exclude_ids_extract_json_string_field(s, "doc_id", scan_limit)
+                )
+                if uid:
+                    out.add(uid)
+    except Exception:
+        out = set()
+    try:
+        Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(out_path, "wt", encoding="utf-8") as w:
+            for s in out:
+                w.write(s)
+                w.write("\n")
+    except Exception:
+        return (lines_seen, 0)
+    return (lines_seen, len(out))
 
 
 # -------------------------
@@ -533,7 +651,7 @@ def run_pipeline(
         print(f"[error] no configs found under {config_dir}", file=sys.stderr)
         return 2
 
-    def _load_blacklist_ids(folder: str) -> set[str]:
+    def _load_blacklist_ids(folder: str, *, workers: int = 1) -> set[str]:
         """
         Load a blacklist of ids/uuids from any files under `folder`.
 
@@ -549,6 +667,18 @@ def run_pipeline(
             print(f"[warn] exclude_ids_dir={folder!r} does not exist or is not a directory; ignoring", file=sys.stderr)
             return set()
 
+        t0 = time.monotonic()
+        workers = max(1, int(workers))
+        # Default to process-based parallelism so it shows up as true multi-process work in `top`
+        # and can bypass the GIL for Python-heavy scanning.
+        # Users can override via UDATA_EXCLUDE_IDS_PARALLEL_MODE=thread|process.
+        parallel_mode = os.environ.get("UDATA_EXCLUDE_IDS_PARALLEL_MODE", "process").strip().lower()
+        if parallel_mode not in ("thread", "process"):
+            parallel_mode = "thread"
+        # Safety: process pools are not reliable on Windows/spawn-only environments for nested multiprocessing
+        # setups; fall back to threads there.
+        if sys.platform.startswith("win"):
+            parallel_mode = "thread"
         ids: set[str] = set()
         files: list[Path] = []
         for p in root.rglob("*"):
@@ -567,65 +697,311 @@ def run_pipeline(
             if s:
                 ids.add(s)
 
-        for p in files:
-            # prefer streaming; treat unknown files as plain text
+        scan_limit = int(os.environ.get("UDATA_EXCLUDE_IDS_SCAN_LIMIT", "16384"))
+        scan_limit = 1024 if scan_limit < 1024 else scan_limit
+
+        def _extract_json_string_field(line: str, key: str) -> str | None:
+            """
+            Fast-path extractor for JSONL lines that are dict-like JSON objects.
+
+            Why:
+            - Your blacklist files can be huge and include a large "text" field.
+            - json.loads(line) forces parsing that large field and is very slow.
+            - We only need uuid/id/doc_id, so we scan and parse only that JSON string value.
+
+            This supports basic JSON escapes inside the string value.
+            """
+            if not line or line[0] != "{":
+                return None
+            # Find `"key"` token first (including quotes to reduce false positives).
+            needle = f"\"{key}\""
+            # Only scan the head to avoid spending time scanning huge "text" tails.
+            head = line if len(line) <= scan_limit else line[:scan_limit]
+            i = head.find(needle)
+            if i < 0:
+                return None
+            i += len(needle)
+            # Skip to colon.
+            n = len(line)
+            while i < n and line[i].isspace():
+                i += 1
+            if i >= n or line[i] != ":":
+                return None
+            i += 1
+            while i < n and line[i].isspace():
+                i += 1
+            if i >= n or line[i] != "\"":
+                return None
+            i += 1
+            # Parse JSON string value.
+            out_chars: list[str] = []
+            while i < n:
+                c = line[i]
+                if c == "\"":
+                    return "".join(out_chars)
+                if c == "\\":
+                    i += 1
+                    if i >= n:
+                        return None
+                    esc = line[i]
+                    if esc in ("\\", "\"", "/"):
+                        out_chars.append(esc)
+                    elif esc == "b":
+                        out_chars.append("\b")
+                    elif esc == "f":
+                        out_chars.append("\f")
+                    elif esc == "n":
+                        out_chars.append("\n")
+                    elif esc == "r":
+                        out_chars.append("\r")
+                    elif esc == "t":
+                        out_chars.append("\t")
+                    elif esc == "u":
+                        # Minimal \uXXXX support.
+                        if i + 4 >= n:
+                            return None
+                        hexs = line[i + 1 : i + 5]
+                        try:
+                            out_chars.append(chr(int(hexs, 16)))
+                        except Exception:
+                            return None
+                        i += 4
+                    else:
+                        # Unknown escape; treat as failure.
+                        return None
+                else:
+                    out_chars.append(c)
+                i += 1
+            return None
+
+        chunk_mb = int(os.environ.get("UDATA_EXCLUDE_IDS_CHUNK_MB", "512"))
+        chunk_mb = 64 if chunk_mb < 64 else chunk_mb
+        chunk_bytes = int(chunk_mb * 1024 * 1024)
+
+        def _scan_jsonl_range(path: str, start: int, end: int) -> set[str]:
+            out: set[str] = set()
             try:
-                if p.suffix == ".gz" and p.name.endswith(".jsonl.gz"):
-                    import gzip
-
-                    with gzip.open(p, "rt", encoding="utf-8", errors="replace") as f:
-                        for line in f:
-                            s = line.strip()
-                            if not s:
-                                continue
-                            if not (s.startswith("{") or s.startswith("[")):
-                                _add(s)
-                                continue
-                            try:
-                                obj = json.loads(s)
-                            except Exception:
-                                continue
-                            if isinstance(obj, str):
-                                _add(obj)
-                            elif isinstance(obj, dict):
-                                _add(obj.get("uuid"))
-                                _add(obj.get("id"))
-                                _add(obj.get("doc_id"))
-                    continue
-
-                if p.suffix == ".jsonl":
-                    with p.open("rt", encoding="utf-8", errors="replace") as f:
-                        for line in f:
-                            s = line.strip()
-                            if not s:
-                                continue
-                            if not (s.startswith("{") or s.startswith("[")):
-                                _add(s)
-                                continue
-                            try:
-                                obj = json.loads(s)
-                            except Exception:
-                                continue
-                            if isinstance(obj, str):
-                                _add(obj)
-                            elif isinstance(obj, dict):
-                                _add(obj.get("uuid"))
-                                _add(obj.get("id"))
-                                _add(obj.get("doc_id"))
-                    continue
-
-                # fallback: plain text
-                with p.open("rt", encoding="utf-8", errors="replace") as f:
-                    for line in f:
-                        _add(line)
+                with open(path, "rt", encoding="utf-8", errors="replace") as f:
+                    f.seek(max(0, int(start)))
+                    if start > 0:
+                        # align to next full line
+                        f.readline()
+                    while True:
+                        pos = f.tell()
+                        if pos >= end:
+                            break
+                        line = f.readline()
+                        if not line:
+                            break
+                        s = line.strip()
+                        if not s:
+                            continue
+                        if not s.startswith("{"):
+                            out.add(s)
+                            continue
+                        uid = (
+                            _extract_json_string_field(s, "uuid")
+                            or _extract_json_string_field(s, "id")
+                            or _extract_json_string_field(s, "doc_id")
+                        )
+                        if uid:
+                            out.add(uid)
             except Exception:
-                # ignore unreadable files (permissions, etc.)
+                return out
+            return out
+
+        def _scan_text_file(path: str) -> set[str]:
+            out: set[str] = set()
+            try:
+                with open(path, "rt", encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        s = str(line).strip()
+                        if s:
+                            out.add(s)
+            except Exception:
+                return out
+            return out
+
+        def _scan_jsonl_gz(path: str) -> set[str]:
+            out: set[str] = set()
+            try:
+                import gzip
+
+                with gzip.open(path, "rt", encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        s = line.strip()
+                        if not s:
+                            continue
+                        if not s.startswith("{"):
+                            out.add(s)
+                            continue
+                        uid = (
+                            _extract_json_string_field(s, "uuid")
+                            or _extract_json_string_field(s, "id")
+                            or _extract_json_string_field(s, "doc_id")
+                        )
+                        if uid:
+                            out.add(uid)
+            except Exception:
+                return out
+            return out
+
+        # Build scan tasks (file-level and chunk-level)
+        tasks: list[tuple[str, str, int, int]] = []
+        total_bytes = 0
+        for p in files:
+            try:
+                fsize = p.stat().st_size
+            except Exception:
+                fsize = 0
+
+            if p.suffix == ".gz" and p.name.endswith(".jsonl.gz"):
+                tasks.append(("jsonl_gz", p.as_posix(), 0, 0))
                 continue
 
-        print(f"[info] exclude-ids: loaded {len(ids):,} ids from {root}", file=sys.stderr)
+            if p.suffix == ".jsonl" and fsize > 0 and workers > 1 and fsize >= chunk_bytes:
+                total_bytes += fsize
+                n_parts = int((fsize + chunk_bytes - 1) // chunk_bytes)
+                n_parts = max(1, min(workers, n_parts))
+                part_size = int((fsize + n_parts - 1) // n_parts)
+                for i in range(n_parts):
+                    start = i * part_size
+                    end = min(fsize, (i + 1) * part_size)
+                    tasks.append(("jsonl_range", p.as_posix(), int(start), int(end)))
+                print(
+                    f"[info] exclude-ids: {p.name}: split into {n_parts} chunk(s) (~{(part_size/(1024**2)):.0f}MB each) "
+                    f"workers={workers} scan_limit={scan_limit}B",
+                    file=sys.stderr,
+                )
+                continue
+
+            if p.suffix == ".jsonl":
+                tasks.append(("jsonl_range", p.as_posix(), 0, max(int(fsize), 1 << 60)))
+                continue
+
+            # fallback: treat as plain text
+            tasks.append(("text", p.as_posix(), 0, 0))
+
+        if workers <= 1 or len(tasks) <= 1:
+            # sequential mode (still uses fast extractor)
+            for kind, path, start, end in tasks:
+                if kind == "jsonl_gz":
+                    ids |= _scan_jsonl_gz(path)
+                elif kind == "jsonl_range":
+                    ids |= _scan_jsonl_range(path, start, end)
+                else:
+                    ids |= _scan_text_file(path)
+        else:
+            print(
+                f"[info] exclude-ids: parallel scan starting (mode={parallel_mode} tasks={len(tasks)} workers={workers} "
+                f"chunk_mb={chunk_mb} scan_limit={scan_limit})",
+                file=sys.stderr,
+            )
+            done = 0
+            done_bytes = 0
+            last_log_t = time.monotonic()
+            if parallel_mode == "process":
+                # Process mode avoids GIL limits; workers write ids to temp files to avoid huge IPC/pickling.
+                import hashlib
+
+                tmp_root = out_root / "_exclude_ids_cache" / hashlib.sha1(str(root).encode("utf-8")).hexdigest()[:12]
+                tmp_root.mkdir(parents=True, exist_ok=True)
+                with ProcessPoolExecutor(max_workers=workers) as ex:
+                    futs = {}
+                    for idx, (kind, path, start, end) in enumerate(tasks):
+                        if kind == "jsonl_range":
+                            outp = (tmp_root / f"{Path(path).name}.part{idx:05d}.ids.txt").as_posix()
+                            fut = ex.submit(
+                                _exclude_ids_scan_jsonl_range_to_file, path, int(start), int(end), int(scan_limit), outp
+                            )
+                            futs[fut] = ("jsonl_range_file", outp, max(0, int(end) - int(start)))
+                        else:
+                            # fall back to thread-like scan inside the main process for gz/text
+                            # (process-safe chunking for gzip isn't supported; text files are typically small)
+                            if kind == "jsonl_gz":
+                                got = _scan_jsonl_gz(path)
+                                if got:
+                                    ids |= got
+                            else:
+                                got = _scan_text_file(path)
+                                if got:
+                                    ids |= got
+
+                    for fut in as_completed(futs):
+                        _k, outp, b = futs[fut]
+                        try:
+                            fut.result()
+                        except Exception:
+                            pass
+                        # merge this part
+                        try:
+                            with open(outp, "rt", encoding="utf-8", errors="replace") as r:
+                                for line in r:
+                                    s = line.strip()
+                                    if s:
+                                        ids.add(s)
+                        except Exception:
+                            pass
+                        done += 1
+                        done_bytes += int(b or 0)
+                        now = time.monotonic()
+                        if now - last_log_t >= 5.0 or done == len(futs):
+                            pct = (100.0 * done_bytes / total_bytes) if total_bytes else 0.0
+                            print(
+                                f"[info] exclude-ids: progress {done}/{len(futs)} tasks, ids={len(ids):,}"
+                                + (f", ~{pct:.1f}% bytes" if total_bytes else ""),
+                                file=sys.stderr,
+                            )
+                            last_log_t = now
+            else:
+                with ThreadPoolExecutor(max_workers=workers) as ex:
+                    futs = {}
+                    for kind, path, start, end in tasks:
+                        if kind == "jsonl_gz":
+                            fut = ex.submit(_scan_jsonl_gz, path)
+                            futs[fut] = (kind, path, 0)
+                        elif kind == "jsonl_range":
+                            fut = ex.submit(_scan_jsonl_range, path, start, end)
+                            futs[fut] = (kind, path, max(0, int(end) - int(start)))
+                        else:
+                            fut = ex.submit(_scan_text_file, path)
+                            futs[fut] = (kind, path, 0)
+
+                    for fut in as_completed(futs):
+                        kind, path, b = futs[fut]
+                        try:
+                            got = fut.result()
+                        except Exception:
+                            got = set()
+                        if got:
+                            ids |= got
+                        done += 1
+                        done_bytes += int(b or 0)
+                        now = time.monotonic()
+                        if now - last_log_t >= 5.0 or done == len(futs):
+                            pct = (100.0 * done_bytes / total_bytes) if total_bytes else 0.0
+                            print(
+                                f"[info] exclude-ids: progress {done}/{len(futs)} tasks, ids={len(ids):,}"
+                                + (f", ~{pct:.1f}% bytes" if total_bytes else ""),
+                                file=sys.stderr,
+                            )
+                            last_log_t = now
+
+        dt = time.monotonic() - t0
+        print(f"[info] exclude-ids: loaded {len(ids):,} ids from {root} in {dt:.1f}s", file=sys.stderr)
         return ids
 
-    blacklist_ids = _load_blacklist_ids(exclude_ids_dir)
+    exclude_workers_env = os.environ.get("UDATA_EXCLUDE_IDS_WORKERS", "").strip()
+    exclude_workers = 1
+    if exclude_workers_env:
+        try:
+            exclude_workers = int(exclude_workers_env)
+        except Exception:
+            exclude_workers = 1
+    else:
+        # Follow user-level parallelism: `-j` sets workers_override; otherwise fall back to tasks_override.
+        exclude_workers = int(workers_override or tasks_override or 1)
+    blacklist_ids = _load_blacklist_ids(exclude_ids_dir, workers=exclude_workers)
 
     def _stage(msg: str, *, dataset: str = "") -> None:
         ds = f" {dataset}:" if dataset else ""
