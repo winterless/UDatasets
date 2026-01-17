@@ -2197,9 +2197,15 @@ def run_pipeline(
                 else ("prepare-only" if prepare_only else ("prepare+full" if prepare else "full"))
             )
             total_mb_str = f"{(total_bytes / (1024 * 1024)):.1f}MB" if total_bytes else "0MB"
+            start_method = str(exec_cfg.get("start_method", exec_cfg.get("mp_start_method", "forkserver")) or "").strip()
+            if start_method not in {"forkserver", "fork", "spawn"}:
+                print(f"[warn] {name}: unknown executor.start_method={start_method!r}; using 'forkserver'", file=sys.stderr)
+                start_method = "forkserver"
+
             print(
                 f"[run] {name} source={source['type']} dir={source['data_dir']} glob={glob_desc} "
-                f"files={file_count} size={total_mb_str} tasks={tasks} workers={workers}({workers_src}) token_budget={tb}({tb_mode}) out={out_mode}",
+                f"files={file_count} size={total_mb_str} tasks={tasks} workers={workers}({workers_src}) "
+                f"mp_start={start_method} token_budget={tb}({tb_mode}) out={out_mode}",
                 file=sys.stderr,
             )
 
@@ -2217,9 +2223,18 @@ def run_pipeline(
 
             threading.Thread(target=_hb, daemon=True).start()
 
-            _stage("executor starting (LocalPipelineExecutor.run)", dataset=name)
+            _stage(
+                f"executor starting (LocalPipelineExecutor.run) tasks={tasks} workers={workers} mp_start={start_method} pid={os.getpid()}",
+                dataset=name,
+            )
             t_exec0 = time.monotonic()
-            LocalPipelineExecutor(pipeline=pipeline, logging_dir=str(logs_dir), tasks=tasks, workers=workers).run()
+            LocalPipelineExecutor(
+                pipeline=pipeline,
+                logging_dir=str(logs_dir),
+                tasks=tasks,
+                workers=workers,
+                start_method=start_method,
+            ).run()
             hb_stop.set()
             dur_s = time.monotonic() - t_exec0
             if dur_s >= 1.0:
