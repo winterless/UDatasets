@@ -15,6 +15,7 @@
     "kind": "nemotron-math-v2"
   },
   "executor": {
+    "start_method": "fork",
     "token_budget_mode": "global_pool",
     "target_shard_mb": 50000000,
     "min_shard_mb": 2,

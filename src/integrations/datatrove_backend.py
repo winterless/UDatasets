@@ -619,6 +619,15 @@ def _global_pool_sample_parquet_to_shards(
 
     # split budget exactly across workers
     w = min(build_workers, len(files))
+    if build_workers > 1 and len(files) == 1:
+        # Important UX note: our parallelism here is per-input-file, so a single huge parquet cannot be sped up
+        # much by increasing build_workers (unless the parquet itself is pre-sharded into multiple files).
+        print(
+            f"[warn] {dataset_name}: global_pool(parquet) has only 1 input file; "
+            f"pool_workers={int(build_workers)} won't help much. "
+            f"Tip: split the parquet into many files to enable real parallel read/convert.",
+            file=sys.stderr,
+        )
     base = token_budget // w
     rem = token_budget % w
     budgets = [(base + 1) if i < rem else base for i in range(w)]
@@ -2239,23 +2248,47 @@ def run_pipeline(
             dur_s = time.monotonic() - t_exec0
             if dur_s >= 1.0:
                 print(f"[done] {name}: executor finished in {dur_s:.1f}s", file=sys.stderr)
+            # datatrove writes one completion marker per rank (when enabled by its executor implementation)
+            try:
+                comp_dir = Path(logs_dir) / "completions"
+                if comp_dir.exists():
+                    comp_n = len(list(comp_dir.iterdir()))
+                    print(f"[info] {name}: completions={comp_n}/{tasks} ({comp_dir})", file=sys.stderr)
+            except Exception:
+                pass
             # --- postprocess: merge outputs to a target number of files ---
             merge_to = int(exec_cfg.get("merge_to_files", exec_cfg.get("merge_outputs_to_files", 0)) or 0)
             if merge_to > 0:
                 keep_inputs = bool(exec_cfg.get("merge_keep_inputs", False))
                 for d in required_dirs:
                     try:
+                        # Merge is intentionally single-process and I/O-bound; log it explicitly to avoid confusion
+                        # with "executor not parallel".
+                        in_files = sorted([p for p in Path(d).glob("*.jsonl") if p.is_file()])
+                        in_bytes = 0
+                        for p in in_files:
+                            try:
+                                in_bytes += p.stat().st_size
+                            except Exception:
+                                pass
+                        _stage(
+                            f"post-merge starting: dir={d} files={len(in_files)} size≈{(in_bytes/(1024**3)):.2f}GB -> target_files={merge_to} keep_inputs={keep_inputs}",
+                            dataset=name,
+                        )
+                        t_m0 = time.monotonic()
                         merged = _merge_jsonl_folder_to_n(
                             Path(d),
                             target_files=merge_to,
                             keep_inputs=keep_inputs,
                             prefix="merged",
                         )
+                        mdur = time.monotonic() - t_m0
                         if merged:
                             print(
                                 f"[post] {name}: merged {Path(d)} -> {len(merged)} file(s) (target={merge_to}, keep_inputs={keep_inputs})",
                                 file=sys.stderr,
                             )
+                        _stage(f"post-merge finished in {mdur:.1f}s", dataset=name)
                     except Exception:
                         print(f"[warn] {name}: post-merge failed for {d}", file=sys.stderr)
                         print(traceback.format_exc(), file=sys.stderr)
