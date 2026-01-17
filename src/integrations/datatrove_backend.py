@@ -885,8 +885,9 @@ class ProgressLogger(PipelineStep):
             total_rate = n / dt
             tok = token_est
             tok_s = tok / dt if tok > 0 else 0.0
+            pid = os.getpid()
             print(
-                f"[rank {rank}/{world_size}] {self.dataset_name}: docs={n:,} "
+                f"[rank {rank}/{world_size} pid={pid}] {self.dataset_name}: docs={n:,} "
                 f"rate={rate:,.1f}/s avg={total_rate:,.1f}/s"
                 + (f" tok≈{tok:,} tok/s≈{tok_s:,.1f}" if tok > 0 else ""),
                 file=sys.stderr,
@@ -1243,6 +1244,8 @@ def run_pipeline(
     force: bool = False,
     mixed_name: str = "",
     exclude_ids_dir: str = "",
+    reuse_exclude_ids_cache: bool = False,
+    reuse_pool: bool = False,
     system_ratio: float = 0.0,
     system_max_chars: int = 2000,
     seed: int = 42,
@@ -1618,7 +1621,7 @@ def run_pipeline(
         cache_dir = out_root / "_exclude_ids_cache" / "persist" / cache_key
         cache_file = cache_dir / "ids.txt"
         cache_meta = cache_dir / "meta.json"
-        if cache_file.exists() and not force:
+        if cache_file.exists() and (not force or reuse_exclude_ids_cache):
             ids: set[str] = set()
             t0 = time.monotonic()
             try:
@@ -1713,11 +1716,21 @@ def run_pipeline(
             self._ids = ids
             self._dataset_name = str(dataset_name or "")
             self._mixed = bool(mixed)
+            self._logged = False
 
         def run(self, data, rank: int = 0, world_size: int = 1):  # noqa: ANN001
             if not self._ids:
                 yield from data
                 return
+            if not self._logged:
+                self._logged = True
+                try:
+                    print(
+                        f"[rank {rank}/{world_size} pid={os.getpid()}] ExcludeIdsFilter: enabled ids={len(self._ids):,} mixed={self._mixed}",
+                        file=sys.stderr,
+                    )
+                except Exception:
+                    pass
             prefix = f"{self._dataset_name}::" if (self._mixed and self._dataset_name) else ""
             for doc in data:
                 uid = str(getattr(doc, "id", "") or "")
@@ -2113,7 +2126,7 @@ def run_pipeline(
                             token_budget=int(eff_token_budget),
                             seed=int(eff_seed),
                             chars_per_token=float(eff_chars_per_token),
-                            force=bool(force),
+                            force=bool(force and (not reuse_pool)),
                         )
                     else:
                         # parquet -> jsonl pool shards (方案A), built in parallel
@@ -2139,7 +2152,7 @@ def run_pipeline(
                             seed=int(eff_seed),
                             chars_per_token=float(eff_chars_per_token),
                             build_workers=pool_workers,
-                            force=bool(force),
+                            force=bool(force and (not reuse_pool)),
                         )
                     # Replace source to read from the pool shards, and disable per-rank budget limiter.
                     source = {"type": "jsonl", "data_dir": pool_dir.as_posix(), "glob": "pool_*.jsonl"}

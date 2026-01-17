@@ -44,6 +44,8 @@ PYTHONPATH=src python -m cli.runner \
 - **`--system-max-chars`**：拼入 `raw.system` 的最大字符数上限（避免超长提示重复）
 - **`--mixed NAME`**：mixed 模式：所有数据集写到同一个目录 `<out-root>/mixed/NAME/`
 - **`--exclude-ids-dir DIR`**：加载黑名单 id/uuid：递归扫描 DIR 下所有文件，收集每行 JSON 的 `uuid/id/doc_id`（或纯文本行）；新输出会跳过这些 id
+- **`--reuse-exclude-ids-cache`**：如果 `<out-root>/_exclude_ids_cache` 已存在缓存，则即使配合 `--force` 也不重新扫描 exclude 目录（避免 200GB+ 大文件重复解析）
+- **`--reuse-pool`**：如果 `<out-root>/_pool/<dataset>/` 已存在 pool shards，则即使配合 `--force` 也不重新构建 global_pool（避免重复做 input->pool）
 - **`--prepare`**：额外写一份训练用 prepare 输出（`uuid,text`）
 - **`--prepare-only`**：只写 prepare 输出，不写完整 Document（更省 IO/磁盘）
 - **`--compression {none,gzip}`**：完整 Document 输出是否 gzip 压缩（prepare/mixed 固定不压缩）

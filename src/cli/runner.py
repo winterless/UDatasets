@@ -210,6 +210,18 @@ def main(argv: list[str] | None = None) -> int:
         "Any new documents whose id/uuid is in that blacklist will be skipped. Works with prepare-only and mixed mode.",
     )
     ap.add_argument(
+        "--reuse-exclude-ids-cache",
+        action="store_true",
+        help="Reuse <out-root>/_exclude_ids_cache persisted cache if it exists, even when --force is used. "
+        "This avoids rescanning a huge exclude-ids directory on reruns.",
+    )
+    ap.add_argument(
+        "--reuse-pool",
+        action="store_true",
+        help="Reuse <out-root>/_pool/<dataset>/ pool shards if they already exist, even when --force is used. "
+        "This avoids rebuilding the global_pool on reruns.",
+    )
+    ap.add_argument(
         "--force",
         action="store_true",
         help="Force re-run a dataset by deleting its <out-root>/_logs/<dataset>/ state and existing outputs for that dataset.",
@@ -293,6 +305,8 @@ def main(argv: list[str] | None = None) -> int:
         system_max_chars=int(args.system_max_chars),
         mixed_name=str(args.mixed or "").strip(),
         exclude_ids_dir=(str(Path(args.exclude_ids_dir).expanduser().resolve()) if args.exclude_ids_dir else ""),
+        reuse_exclude_ids_cache=bool(args.reuse_exclude_ids_cache),
+        reuse_pool=bool(args.reuse_pool),
     )
 
 
