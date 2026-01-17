@@ -156,7 +156,6 @@ def hephaestus_adapter(self, data: JsonDict, path: str, id_in_file: int | str) -
     text = raw.get("text") if isinstance(raw.get("text"), str) else ""
     return {"text": _ensure_text(text), "id": doc_id, "metadata": {"dataset": "Hephaestus-Forge", "raw": raw}}
 
-
 def nemotron_math_v2_adapter(self, data: JsonDict, path: str, id_in_file: int | str) -> JsonDict:
     """
     Nemotron-Math-v2 schema (only fields we care about):
@@ -190,13 +189,13 @@ def nemotron_math_v2_adapter(self, data: JsonDict, path: str, id_in_file: int | 
             role_s = role.strip() if isinstance(role, str) else ""
             if role_s:
                 parts.append(role_s)
-            content = m.get("content")
-            if isinstance(content, str) and content.strip():
-                parts.append(content.strip())
             if role_s == "assistant":
                 rc = m.get("reasoning_content")
                 if isinstance(rc, str) and rc.strip():
                     parts.append(rc.strip())
+            content = m.get("content")
+            if isinstance(content, str) and content.strip():
+                parts.append(content.strip())
     text = "\n".join(parts).strip()
     return {"text": _ensure_text(text), "id": doc_id, "metadata": {"dataset": "Nemotron-Math-v2", "raw": raw}}
 
