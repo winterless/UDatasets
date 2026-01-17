@@ -22,6 +22,14 @@ import hashlib
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from typing import Callable, Dict, IO, Literal
 
+try:
+    import orjson  # type: ignore
+
+    _HAS_ORJSON = True
+except Exception:
+    orjson = None  # type: ignore
+    _HAS_ORJSON = False
+
 
 # -------------------------
 # Datatrove import boundary
@@ -763,6 +771,14 @@ class StdJsonlWriter(DiskWriter):
         )
 
     def _write(self, document: dict, file_handler: IO, _filename: str):
+        use_orjson = bool(os.environ.get("UDATA_USE_ORJSON", "1").strip()) and _HAS_ORJSON
+        if use_orjson:
+            try:
+                file_handler.write(orjson.dumps(document, option=orjson.OPT_APPEND_NEWLINE))  # type: ignore[union-attr]
+                return
+            except Exception:
+                # Fall back to stdlib json for objects orjson can't handle.
+                pass
         line = (json.dumps(document, ensure_ascii=False) + "\n").encode("utf-8")
         file_handler.write(line)
 
@@ -1025,6 +1041,52 @@ class SafeJsonlReader(BaseDiskReader):
     def read_file(self, filepath: str):
         bad_json = 0
         null_lines = 0
+        use_orjson = bool(os.environ.get("UDATA_USE_ORJSON", "1").strip()) and _HAS_ORJSON
+
+        # Fast path: binary + orjson (avoids stdlib json overhead on huge JSONL).
+        if use_orjson:
+            with self.data_folder.open(filepath, "rb", compression=self.compression) as f:
+                try:
+                    head = f.read(200)
+                    if head.startswith(b"version https://git-lfs.github.com/spec/v1"):
+                        logger.warning(
+                            f"Skipping `{filepath}`: looks like a Git LFS pointer file (run `git lfs pull` to fetch real content)."
+                        )
+                        return
+                    try:
+                        f.seek(0)
+                    except Exception:
+                        pass
+
+                    for li, raw_line in enumerate(f):
+                        b = raw_line.strip()
+                        if not b:
+                            continue
+                        try:
+                            obj = orjson.loads(b)  # type: ignore[union-attr]
+                        except Exception:
+                            bad_json += 1
+                            continue
+                        if obj is None:
+                            null_lines += 1
+                            continue
+                        if not isinstance(obj, dict):
+                            obj = {"value": obj}
+                        with self.track_time():
+                            document = self.get_document_from_dict(obj, filepath, li)
+                            if not document:
+                                continue
+                        yield document
+                except UnicodeDecodeError as e:
+                    logger.warning(f"File `{filepath}` may be corrupted: raised UnicodeDecodeError ({e})")
+                finally:
+                    if bad_json:
+                        logger.warning(f"In `{filepath}`: skipped {bad_json} invalid JSONL lines")
+                    if null_lines:
+                        logger.warning(f"In `{filepath}`: skipped {null_lines} `null` JSONL lines")
+            return
+
+        # Fallback: text + stdlib json
         with self.data_folder.open(filepath, "r", compression=self.compression) as f:
             try:
                 head = f.read(200)
