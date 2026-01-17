@@ -20,6 +20,7 @@
     "min_shard_mb": 2,
     "token_billions": 40,
     "tasks": 192,
+    "workers": 192,
     "merge_to_files": 1
   }
 }

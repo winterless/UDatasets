@@ -1569,15 +1569,29 @@ def run_pipeline(
                 pass
 
         exclude_workers_env = os.environ.get("UDATA_EXCLUDE_IDS_WORKERS", "").strip()
-        exclude_workers = 1
+        exclude_workers = 0
+        exclude_workers_src = ""
         if exclude_workers_env:
             try:
                 exclude_workers = int(exclude_workers_env)
+                exclude_workers_src = "env:UDATA_EXCLUDE_IDS_WORKERS"
             except Exception:
-                exclude_workers = 1
-        else:
-            # Follow user-level parallelism: `-j` sets workers_override; otherwise fall back to tasks_override.
-            exclude_workers = int(workers_override or tasks_override or 1)
+                exclude_workers = 0
+        if exclude_workers <= 0:
+            # Follow user-level parallelism: `-j` sets workers_override.
+            if workers_override and int(workers_override) > 0:
+                exclude_workers = int(workers_override)
+                exclude_workers_src = "cli:-j"
+            else:
+                # Default: do NOT tie exclude scan parallelism to `tasks` (users often set tasks=1 to get 1 output file).
+                exclude_workers = min(32, (os.cpu_count() or 1))
+                exclude_workers_src = "default:cpu"
+        exclude_workers = max(1, int(exclude_workers))
+        print(
+            f"[info] exclude-ids: workers={exclude_workers} ({exclude_workers_src}) "
+            f"(override with UDATA_EXCLUDE_IDS_WORKERS; mode={os.environ.get('UDATA_EXCLUDE_IDS_PARALLEL_MODE','process')})",
+            file=sys.stderr,
+        )
 
         ids = _load_blacklist_ids(exclude_ids_dir, workers=exclude_workers)
         blacklist_ids_cache = ids
@@ -1982,9 +1996,25 @@ def run_pipeline(
                         )
                         tasks = max_tasks_no_trunc
 
-            workers = int(workers_override) if workers_override is not None else int(exec_cfg.get("workers", 8))
-            workers = max(1, min(workers, tasks))
-            tasks = max(1, tasks)
+            # Datatrove parallelism:
+            # - `tasks`: how many sub-tasks/shards exist (often maps to output files)
+            # - `workers`: how many worker processes run those tasks in parallel
+            #
+            # Users often set `tasks` high (e.g. 192) expecting speedups; but if `workers` stays low (default=8),
+            # execution is still limited to 8 concurrent processes. So we default workers to CPU count (capped),
+            # unless explicitly overridden.
+            cpu = int(os.cpu_count() or 1)
+            if workers_override is not None:
+                workers = int(workers_override)
+                workers_src = "cli"
+            elif "workers" in exec_cfg:
+                workers = int(exec_cfg.get("workers", 8))
+                workers_src = "config"
+            else:
+                workers = min(tasks, min(32, cpu))
+                workers_src = "default:cpu"
+            workers = max(1, min(int(workers), int(tasks)))
+            tasks = max(1, int(tasks))
 
             # --- optional: global pool token sampling (JSONL only) ---
             if global_pool_enabled and eff_token_budget:
@@ -2016,8 +2046,18 @@ def run_pipeline(
                         )
                     else:
                         # parquet -> jsonl pool shards (方案A), built in parallel
-                        pool_workers = int(exec_cfg.get("global_pool_workers", exec_cfg.get("pool_workers", workers_override or 1)))
-                        pool_workers = max(1, pool_workers)
+                        # `global_pool_workers` controls how many processes build the pool shards (parquet->jsonl).
+                        # If not specified, follow -j, else default to CPU count (capped) for better throughput.
+                        cpu = int(os.cpu_count() or 1)
+                        if "global_pool_workers" in exec_cfg:
+                            pool_workers = int(exec_cfg.get("global_pool_workers"))
+                        elif "pool_workers" in exec_cfg:
+                            pool_workers = int(exec_cfg.get("pool_workers"))
+                        elif workers_override is not None:
+                            pool_workers = int(workers_override)
+                        else:
+                            pool_workers = min(32, cpu)
+                        pool_workers = max(1, int(pool_workers))
                         _global_pool_sample_parquet_to_shards(
                             input_files=matched_files,
                             adapter_kind=adapter_kind,
@@ -2159,7 +2199,7 @@ def run_pipeline(
             total_mb_str = f"{(total_bytes / (1024 * 1024)):.1f}MB" if total_bytes else "0MB"
             print(
                 f"[run] {name} source={source['type']} dir={source['data_dir']} glob={glob_desc} "
-                f"files={file_count} size={total_mb_str} tasks={tasks} workers={workers} token_budget={tb}({tb_mode}) out={out_mode}",
+                f"files={file_count} size={total_mb_str} tasks={tasks} workers={workers}({workers_src}) token_budget={tb}({tb_mode}) out={out_mode}",
                 file=sys.stderr,
             )
 
