@@ -62,8 +62,6 @@ def prepare_sharded_configs(
     config_dir: str,
     out_root: str,
     shard_jsonl_mb: float,
-    only: str,
-    force: bool,
 ) -> str:
     """
     Create a derived config directory under <out_root>/_configs_sharded/ where JSONL datasets
@@ -80,8 +78,7 @@ def prepare_sharded_configs(
     # If we wrote a relative data_dir like "out/_shards/...", it would incorrectly become <datasets_root>/out/_shards/...
     out_root_p = Path(out_root).expanduser().resolve()
     derived = out_root_p / "_configs_sharded"
-    if force:
-        shutil.rmtree(derived, ignore_errors=True)
+    shutil.rmtree(derived, ignore_errors=True)
     derived.mkdir(parents=True, exist_ok=True)
 
     datasets_root_p = Path(datasets_root).expanduser().resolve()
@@ -93,11 +90,6 @@ def prepare_sharded_configs(
         name = (ds.get("name") or "").strip()
         if not name:
             continue
-        if only and name != only:
-            # copy as-is for non-targeted datasets (so the derived dir is complete)
-            (derived / cfg_path.name).write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-            continue
-
         sources = cfg.get("sources", []) or []
         if not sources or not isinstance(sources, list):
             (derived / cfg_path.name).write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -115,8 +107,7 @@ def prepare_sharded_configs(
         files = [p for p in base.glob(glob_pat) if p.is_file()] if (base.exists() and glob_pat) else []
 
         shard_dir = out_root_p / "_shards" / name
-        if force:
-            shutil.rmtree(shard_dir, ignore_errors=True)
+        shutil.rmtree(shard_dir, ignore_errors=True)
         shard_dir.mkdir(parents=True, exist_ok=True)
 
         for p in files:
@@ -134,9 +125,7 @@ def prepare_sharded_configs(
             if p.suffix.lower() == ".jsonl":
                 try:
                     if p.stat().st_size >= target_bytes:
-                        existing = list(shard_dir.glob(f"{prefix}.part*.jsonl"))
-                        if not existing:
-                            _shard_jsonl_file(p, shard_dir, target_bytes=target_bytes, prefix=prefix)
+                        _shard_jsonl_file(p, shard_dir, target_bytes=target_bytes, prefix=prefix)
                         continue
                 except Exception:
                     pass
@@ -160,22 +149,6 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--config-dir", default="configs/datasets")
     ap.add_argument("--out-root", default="out/datatrove_documents")
     ap.add_argument(
-        "-j",
-        "--parallelism",
-        type=int,
-        default=None,
-        help="Convenience flag to set both --tasks and --workers to the same value. "
-        "You can still override them individually with --tasks/--workers.",
-    )
-    ap.add_argument(
-        "-J",
-        "--dataset-parallelism",
-        type=int,
-        default=1,
-        help="Run multiple datasets (configs) concurrently. Default: 1 (sequential). "
-        "Note: each dataset still uses its own tasks/workers; keep -j small to avoid oversubscribing CPU/disk.",
-    )
-    ap.add_argument(
         "--shard-jsonl-mb",
         type=float,
         default=0.0,
@@ -188,13 +161,7 @@ def main(argv: list[str] | None = None) -> int:
         type=float,
         default=0.0,
         help="With probability in [0,1], prepend raw['system'] (tool/spec instructions) into text for datasets that have it. "
-        "Selection is stable based on doc id and --seed. 0 disables.",
-    )
-    ap.add_argument(
-        "--system-max-chars",
-        type=int,
-        default=2000,
-        help="Max chars of raw['system'] to prepend when --system-ratio>0 (to avoid huge repeated prompts).",
+        "Selection is stable based on doc id. 0 disables.",
     )
     ap.add_argument(
         "--mixed",
@@ -207,30 +174,7 @@ def main(argv: list[str] | None = None) -> int:
         "--exclude-ids-dir",
         default="",
         help="Optional: folder containing prior outputs (or any files) from which to collect id/uuid values as a blacklist. "
-        "Any new documents whose id/uuid is in that blacklist will be skipped. Works with prepare-only and mixed mode.",
-    )
-    ap.add_argument(
-        "--reuse-exclude-ids-cache",
-        action="store_true",
-        help="Reuse <out-root>/_exclude_ids_cache persisted cache if it exists, even when --force is used. "
-        "This avoids rescanning a huge exclude-ids directory on reruns.",
-    )
-    ap.add_argument(
-        "--reuse-pool",
-        action="store_true",
-        help="Reuse <out-root>/_pool/<dataset>/ pool shards if they already exist, even when --force is used. "
-        "This avoids rebuilding the global_pool on reruns.",
-    )
-    ap.add_argument(
-        "--force",
-        action="store_true",
-        help="Force re-run a dataset by deleting its <out-root>/_logs/<dataset>/ state and existing outputs for that dataset.",
-    )
-    ap.add_argument(
-        "--tasks",
-        type=int,
-        default=None,
-        help="Override number of datatrove tasks. If omitted, use config `executor.tasks` (fallback 20).",
+        "Any new documents whose id/uuid is in that blacklist will be skipped. Works with prepare and mixed mode.",
     )
     ap.add_argument(
         "--workers",
@@ -239,37 +183,7 @@ def main(argv: list[str] | None = None) -> int:
         help="Override number of datatrove workers. If omitted, use config `executor.workers` (fallback 8).",
     )
     ap.add_argument("--limit", type=int, default=-1, help="Limit documents (debug). -1 for full")
-    ap.add_argument("--only", default="", help="Only run a single dataset by name (dataset.name)")
-    ap.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-        help="Seed used for stable sampling/shuffling (when enabled in dataset configs) and for --system-ratio selection.",
-    )
-    ap.add_argument(
-        "--prepare",
-        action="store_true",
-        help="Also write a CPT-friendly view under <out-root>/prepare/<dataset>/ with JSONL lines containing only {uuid,text}.",
-    )
-    ap.add_argument(
-        "--prepare-only",
-        action="store_true",
-        help="Only write the CPT-friendly prepare output (uuid+text) and skip the full Document output. Implies --prepare.",
-    )
-    ap.add_argument(
-        "--compression",
-        default="none",
-        choices=["gzip", "none"],
-        help="Output compression. Default: none (plain .jsonl). Use 'gzip' to write .jsonl.gz.",
-    )
     args = ap.parse_args(argv)
-
-    if args.parallelism is not None:
-        # Default to setting both when not explicitly set.
-        if args.tasks is None:
-            args.tasks = int(args.parallelism)
-        if args.workers is None:
-            args.workers = int(args.parallelism)
 
     # Import lazily so `--help` works even if datatrove isn't importable yet.
     from integrations.datatrove_backend import run_pipeline
@@ -283,30 +197,17 @@ def main(argv: list[str] | None = None) -> int:
         config_dir=config_dir_in,
         out_root=out_root,
         shard_jsonl_mb=float(args.shard_jsonl_mb),
-        only=str(args.only or ""),
-        force=bool(args.force),
     )
 
     return run_pipeline(
         datasets_root=datasets_root,
         config_dir=config_dir,
         out_root=out_root,
-        tasks_override=args.tasks,
         workers_override=args.workers,
         limit=args.limit,
-        only=args.only,
-        compression=(None if args.compression == "none" else args.compression),
-        prepare=bool(args.prepare or args.prepare_only),
-        prepare_only=bool(args.prepare_only),
-        dataset_parallelism=int(args.dataset_parallelism),
-        force=bool(args.force),
-        seed=int(args.seed),
         system_ratio=float(args.system_ratio),
-        system_max_chars=int(args.system_max_chars),
         mixed_name=str(args.mixed or "").strip(),
         exclude_ids_dir=(str(Path(args.exclude_ids_dir).expanduser().resolve()) if args.exclude_ids_dir else ""),
-        reuse_exclude_ids_cache=bool(args.reuse_exclude_ids_cache),
-        reuse_pool=bool(args.reuse_pool),
     )
 
 

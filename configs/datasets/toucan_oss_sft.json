@@ -17,7 +17,6 @@
   },
   "executor": {
     "target_shard_mb": 50,
-    "min_shard_mb": 2,
     "token_billions": 0.0
   },
   "enabled": false

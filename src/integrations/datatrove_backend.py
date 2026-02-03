@@ -15,10 +15,12 @@ import shutil
 import sys
 from pathlib import Path
 import random
+import math
 import time
 import traceback
 import threading
 import hashlib
+import tempfile
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from typing import Callable, Dict, IO, Literal
 
@@ -204,15 +206,13 @@ def _global_pool_sample_jsonl_to_shards(
     out_dir: Path,
     tasks: int,
     token_budget: int,
-    seed: int,
     chars_per_token: float,
-    force: bool,
 ) -> Path:
     """
     Build a "global pool" sample across ALL input files, then split into `tasks` shard files.
 
     Behavior:
-    - Deterministic order: shuffle input_files by seed, then stream lines until token_budget reached.
+    - Shuffle input_files, then stream lines until token_budget reached.
     - Uses adapter-produced `text` length to estimate tokens (same heuristic as TokenBudgetLimiter).
     - Writes raw JSON lines into `out_dir/pool_${rank}.jsonl`, so datatrove can re-read and adapt normally.
     """
@@ -225,14 +225,9 @@ def _global_pool_sample_jsonl_to_shards(
     marker = out_dir / "_DONE"
     shard_paths = [out_dir / f"pool_{r:05d}.jsonl" for r in range(tasks)]
 
-    if marker.exists() and all(p.exists() and p.stat().st_size > 0 for p in shard_paths) and not force:
-        print(f"[info] {dataset_name}: global_pool reuse {out_dir} (tasks={tasks})", file=sys.stderr)
-        return out_dir
-
-    if force:
-        shutil.rmtree(out_dir, ignore_errors=True)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        shard_paths = [out_dir / f"pool_{r:05d}.jsonl" for r in range(tasks)]
+    shutil.rmtree(out_dir, ignore_errors=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    shard_paths = [out_dir / f"pool_{r:05d}.jsonl" for r in range(tasks)]
 
     # ensure clean slate
     for p in shard_paths:
@@ -245,9 +240,8 @@ def _global_pool_sample_jsonl_to_shards(
     except Exception:
         pass
 
-    rng = random.Random(int(seed))
     files = list(input_files)
-    rng.shuffle(files)
+    random.shuffle(files)
 
     if not files:
         print(f"[warn] {dataset_name}: global_pool has 0 input files; skipping", file=sys.stderr)
@@ -346,7 +340,6 @@ def _global_pool_sample_jsonl_to_shards(
                 "dataset": dataset_name,
                 "tasks": tasks,
                 "token_budget": token_budget,
-                "seed": int(seed),
                 "chars_per_token": float(chars_per_token),
                 "docs": int(total_docs),
                 "tokens_est": int(total_tok),
@@ -467,7 +460,6 @@ def _pool_worker_parquet_to_shards(
     out_dir: str,
     tasks: int,
     token_budget: int,
-    seed: int,
     chars_per_token: float,
     batch_size: int = 1024,
 ) -> dict:
@@ -487,7 +479,7 @@ def _pool_worker_parquet_to_shards(
     tasks = max(1, int(tasks))
     token_budget = max(1, int(token_budget))
     chars_per_token = 4.0 if float(chars_per_token) <= 0 else float(chars_per_token)
-    rng = random.Random(int(seed) + int(worker_idx) * 9973)
+    rng = random.Random()
 
     outp = Path(out_dir)
     outp.mkdir(parents=True, exist_ok=True)
@@ -578,10 +570,8 @@ def _global_pool_sample_parquet_to_shards(
     out_dir: Path,
     tasks: int,
     token_budget: int,
-    seed: int,
     chars_per_token: float,
     build_workers: int,
-    force: bool,
 ) -> Path:
     """
     Parquet global pool (方案A): sample from parquet and write `tasks` JSONL shard files, then datatrove reads JSONL.
@@ -596,14 +586,9 @@ def _global_pool_sample_parquet_to_shards(
     marker = out_dir / "_DONE"
     shard_paths = [out_dir / f"pool_{r:05d}.jsonl" for r in range(tasks)]
 
-    if marker.exists() and all(p.exists() and p.stat().st_size > 0 for p in shard_paths) and not force:
-        print(f"[info] {dataset_name}: global_pool(parquet) reuse {out_dir} (tasks={tasks})", file=sys.stderr)
-        return out_dir
-
-    if force:
-        shutil.rmtree(out_dir, ignore_errors=True)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        shard_paths = [out_dir / f"pool_{r:05d}.jsonl" for r in range(tasks)]
+    shutil.rmtree(out_dir, ignore_errors=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    shard_paths = [out_dir / f"pool_{r:05d}.jsonl" for r in range(tasks)]
 
     for p in shard_paths:
         try:
@@ -616,8 +601,7 @@ def _global_pool_sample_parquet_to_shards(
         pass
 
     files = list(input_files)
-    rng = random.Random(int(seed))
-    rng.shuffle(files)
+    random.shuffle(files)
     if not files:
         print(f"[warn] {dataset_name}: global_pool(parquet) has 0 input files; skipping", file=sys.stderr)
         for p in shard_paths:
@@ -670,7 +654,6 @@ def _global_pool_sample_parquet_to_shards(
                 out_dir=outw,
                 tasks=tasks,
                 token_budget=budgets[wi],
-                seed=int(seed),
                 chars_per_token=float(chars_per_token),
             )
             futs[fut] = wi
@@ -722,7 +705,6 @@ def _global_pool_sample_parquet_to_shards(
                 "dataset": dataset_name,
                 "tasks": tasks,
                 "token_budget": token_budget,
-                "seed": int(seed),
                 "chars_per_token": float(chars_per_token),
                 "pool_workers": int(w),
                 "docs": int(total_docs),
@@ -754,7 +736,7 @@ class StdJsonlWriter(DiskWriter):
         self,
         output_folder: DataFolderLike,
         output_filename: str | None = None,
-        compression: str | None = "gzip",
+        compression: str | None = None,
         adapter: Callable | None = None,
         expand_metadata: bool = False,
         max_file_size: int = -1,
@@ -795,11 +777,10 @@ class TokenBudgetLimiter(PipelineStep):
 
     name = "🎛️ TokenBudgetLimiter"
 
-    def __init__(self, token_budget: int, *, seed: int = 42, chars_per_token: float = 4.0):
+    def __init__(self, token_budget: int, *, chars_per_token: float = 4.0):
         super().__init__()
         self.token_budget = int(token_budget)
         self.chars_per_token = float(chars_per_token)
-        self._rng = random.Random(int(seed))
 
     def _estimate_tokens(self, text: str) -> int:
         if not text:
@@ -1143,13 +1124,11 @@ def make_adapter(
     config_path: str,
     *,
     system_ratio: float = 0.0,
-    system_max_chars: int = 2000,
-    seed: int = 42,
 ):
     def _adapter(self, data, path, id_in_file):
         doc = base_adapter(self, data, path, id_in_file)
         # Optionally mix in tool/spec instructions from raw["system"] for a subset of samples.
-        # Selection is stable across parallelism/order via (seed, doc_id) hashing.
+        # Selection is stable across parallelism/order via doc_id hashing.
         if system_ratio and system_ratio > 0:
             try:
                 import hashlib
@@ -1161,13 +1140,10 @@ def make_adapter(
                 if isinstance(sys_text, str) and sys_text.strip() and doc_id:
                     ratio = float(system_ratio)
                     ratio = 0.0 if ratio < 0 else (1.0 if ratio > 1 else ratio)
-                    h = hashlib.sha1(f"{int(seed)}:{doc_id}".encode("utf-8")).digest()
+                    h = hashlib.sha1(doc_id.encode("utf-8")).digest()
                     u = int.from_bytes(h[:8], "big") / float(2**64)
                     if u < ratio:
-                        maxc = int(system_max_chars)
-                        maxc = 0 if maxc < 0 else maxc
-                        sys_snip = sys_text.strip() if maxc == 0 else sys_text.strip()[:maxc]
-                        prefix = f"SYSTEM:\n{sys_snip}\n\n"
+                        prefix = f"SYSTEM:\n{sys_text.strip()}\n\n"
                         t = doc.get("text")
                         if isinstance(t, str):
                             doc["text"] = prefix + t
@@ -1231,24 +1207,11 @@ def run_pipeline(
     datasets_root: str | Path,
     config_dir: str | Path,
     out_root: str | Path,
-    tasks_override: int | None = None,
     workers_override: int | None = None,
     limit: int = -1,
-    only: str = "",
-    compression: str | None = None,
-    prepare: bool = False,
-    prepare_only: bool = False,
-    token_budget: int | None = None,
-    token_budget_parallel: bool = False,
-    dataset_parallelism: int = 1,
-    force: bool = False,
     mixed_name: str = "",
     exclude_ids_dir: str = "",
-    reuse_exclude_ids_cache: bool = False,
-    reuse_pool: bool = False,
     system_ratio: float = 0.0,
-    system_max_chars: int = 2000,
-    seed: int = 42,
     chars_per_token: float = 4.0,
 ) -> int:
     """
@@ -1262,6 +1225,11 @@ def run_pipeline(
     if not cfgs:
         print(f"[error] no configs found under {config_dir}", file=sys.stderr)
         return 2
+
+    if mixed_name:
+        mixed_dir = out_root / "mixed" / mixed_name
+        shutil.rmtree(mixed_dir, ignore_errors=True)
+        mixed_dir.mkdir(parents=True, exist_ok=True)
 
     def _load_blacklist_ids(folder: str, *, workers: int = 1) -> set[str]:
         """
@@ -1514,57 +1482,57 @@ def run_pipeline(
             last_log_t = time.monotonic()
             if parallel_mode == "process":
                 # Process mode avoids GIL limits; workers write ids to temp files to avoid huge IPC/pickling.
-                import hashlib
-
-                tmp_root = out_root / "_exclude_ids_cache" / hashlib.sha1(str(root).encode("utf-8")).hexdigest()[:12]
-                tmp_root.mkdir(parents=True, exist_ok=True)
-                with ProcessPoolExecutor(max_workers=workers) as ex:
-                    futs = {}
-                    for idx, (kind, path, start, end) in enumerate(tasks):
-                        if kind == "jsonl_range":
-                            outp = (tmp_root / f"{Path(path).name}.part{idx:05d}.ids.txt").as_posix()
-                            fut = ex.submit(
-                                _exclude_ids_scan_jsonl_range_to_file, path, int(start), int(end), int(scan_limit), outp
-                            )
-                            futs[fut] = ("jsonl_range_file", outp, max(0, int(end) - int(start)))
-                        else:
-                            # fall back to thread-like scan inside the main process for gz/text
-                            # (process-safe chunking for gzip isn't supported; text files are typically small)
-                            if kind == "jsonl_gz":
-                                got = _scan_jsonl_gz(path)
-                                if got:
-                                    ids |= got
+                tmp_root = Path(tempfile.mkdtemp(prefix="exclude_ids_scan_", dir=str(out_root)))
+                try:
+                    with ProcessPoolExecutor(max_workers=workers) as ex:
+                        futs = {}
+                        for idx, (kind, path, start, end) in enumerate(tasks):
+                            if kind == "jsonl_range":
+                                outp = (tmp_root / f"{Path(path).name}.part{idx:05d}.ids.txt").as_posix()
+                                fut = ex.submit(
+                                    _exclude_ids_scan_jsonl_range_to_file, path, int(start), int(end), int(scan_limit), outp
+                                )
+                                futs[fut] = ("jsonl_range_file", outp, max(0, int(end) - int(start)))
                             else:
-                                got = _scan_text_file(path)
-                                if got:
-                                    ids |= got
+                                # fall back to thread-like scan inside the main process for gz/text
+                                # (process-safe chunking for gzip isn't supported; text files are typically small)
+                                if kind == "jsonl_gz":
+                                    got = _scan_jsonl_gz(path)
+                                    if got:
+                                        ids |= got
+                                else:
+                                    got = _scan_text_file(path)
+                                    if got:
+                                        ids |= got
 
-                    for fut in as_completed(futs):
-                        _k, outp, b = futs[fut]
-                        try:
-                            fut.result()
-                        except Exception:
-                            pass
-                        # merge this part
-                        try:
-                            with open(outp, "rt", encoding="utf-8", errors="replace") as r:
-                                for line in r:
-                                    s = line.strip()
-                                    if s:
-                                        ids.add(s)
-                        except Exception:
-                            pass
-                        done += 1
-                        done_bytes += int(b or 0)
-                        now = time.monotonic()
-                        if now - last_log_t >= 5.0 or done == len(futs):
-                            pct = (100.0 * done_bytes / total_bytes) if total_bytes else 0.0
-                            print(
-                                f"[info] exclude-ids: progress {done}/{len(futs)} tasks, ids={len(ids):,}"
-                                + (f", ~{pct:.1f}% bytes" if total_bytes else ""),
-                                file=sys.stderr,
-                            )
-                            last_log_t = now
+                        for fut in as_completed(futs):
+                            _k, outp, b = futs[fut]
+                            try:
+                                fut.result()
+                            except Exception:
+                                pass
+                            # merge this part
+                            try:
+                                with open(outp, "rt", encoding="utf-8", errors="replace") as r:
+                                    for line in r:
+                                        s = line.strip()
+                                        if s:
+                                            ids.add(s)
+                            except Exception:
+                                pass
+                            done += 1
+                            done_bytes += int(b or 0)
+                            now = time.monotonic()
+                            if now - last_log_t >= 5.0 or done == len(futs):
+                                pct = (100.0 * done_bytes / total_bytes) if total_bytes else 0.0
+                                print(
+                                    f"[info] exclude-ids: progress {done}/{len(futs)} tasks, ids={len(ids):,}"
+                                    + (f", ~{pct:.1f}% bytes" if total_bytes else ""),
+                                    file=sys.stderr,
+                                )
+                                last_log_t = now
+                finally:
+                    shutil.rmtree(tmp_root, ignore_errors=True)
             else:
                 with ThreadPoolExecutor(max_workers=workers) as ex:
                     futs = {}
@@ -1603,45 +1571,9 @@ def run_pipeline(
         print(f"[info] exclude-ids: loaded {len(ids):,} ids from {root} in {dt:.1f}s", file=sys.stderr)
         return ids
 
-    blacklist_ids_cache: set[str] | None = None
-
-    def _get_blacklist_ids() -> set[str]:
-        nonlocal blacklist_ids_cache
-        if blacklist_ids_cache is not None:
-            return blacklist_ids_cache
+    def _get_blacklist_ids():  # noqa: ANN001
         if not exclude_ids_dir:
-            blacklist_ids_cache = set()
-            return blacklist_ids_cache
-
-        # Simple persistent cache: if present and not --force, never rescan exclude_ids_dir.
-        # Cache path is keyed only by the resolved exclude_ids_dir path (no expensive validation).
-        cache_key = hashlib.sha1(str(exclude_ids_dir).encode("utf-8")).hexdigest()[:16]
-        # Persisted cache lives under the existing out/ scratch namespace used by exclude-ids scanning.
-        # User-facing convention: treat this as "the exclude-ids cache", not a generic `_cache` folder.
-        cache_dir = out_root / "_exclude_ids_cache" / "persist" / cache_key
-        cache_file = cache_dir / "ids.txt"
-        cache_meta = cache_dir / "meta.json"
-        if cache_file.exists() and (not force or reuse_exclude_ids_cache):
-            ids: set[str] = set()
-            t0 = time.monotonic()
-            try:
-                with cache_file.open("rt", encoding="utf-8", errors="replace") as f:
-                    for line in f:
-                        s = line.strip()
-                        if s:
-                            ids.add(s)
-                dt = time.monotonic() - t0
-                print(
-                    f"[info] exclude-ids: using cache {cache_file} (ids={len(ids):,}, {dt:.1f}s). "
-                    f"Use --force to rebuild.",
-                    file=sys.stderr,
-                )
-                blacklist_ids_cache = ids
-                return blacklist_ids_cache
-            except Exception:
-                # Fall back to rebuild below.
-                pass
-
+            return set()
         exclude_workers_env = os.environ.get("UDATA_EXCLUDE_IDS_WORKERS", "").strip()
         exclude_workers = 0
         exclude_workers_src = ""
@@ -1667,35 +1599,7 @@ def run_pipeline(
             file=sys.stderr,
         )
 
-        ids = _load_blacklist_ids(exclude_ids_dir, workers=exclude_workers)
-        blacklist_ids_cache = ids
-
-        # Write cache for next run
-        try:
-            cache_dir.mkdir(parents=True, exist_ok=True)
-            tmp = cache_dir / f".ids.txt.tmp.{os.getpid()}"
-            with tmp.open("wt", encoding="utf-8") as w:
-                for s in sorted(ids):
-                    w.write(s)
-                    w.write("\n")
-            tmp.replace(cache_file)
-            cache_meta.write_text(
-                json.dumps(
-                    {
-                        "exclude_ids_dir": str(exclude_ids_dir),
-                        "ids": int(len(ids)),
-                        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-            print(f"[info] exclude-ids: wrote cache {cache_file} (ids={len(ids):,})", file=sys.stderr)
-        except Exception:
-            pass
-        return blacklist_ids_cache
+        return _load_blacklist_ids(exclude_ids_dir, workers=exclude_workers)
 
     def _stage(msg: str, *, dataset: str = "") -> None:
         ds = f" {dataset}:" if dataset else ""
@@ -1711,7 +1615,7 @@ def run_pipeline(
 
         name = "🚫 ExcludeIdsFilter"
 
-        def __init__(self, ids: set[str], *, dataset_name: str = "", mixed: bool = False):
+        def __init__(self, ids, *, dataset_name: str = "", mixed: bool = False):  # noqa: ANN001
             super().__init__()
             self._ids = ids
             self._dataset_name = str(dataset_name or "")
@@ -1719,14 +1623,25 @@ def run_pipeline(
             self._logged = False
 
         def run(self, data, rank: int = 0, world_size: int = 1):  # noqa: ANN001
-            if not self._ids:
+            if self._ids is None:
                 yield from data
                 return
+            try:
+                if hasattr(self._ids, "__len__") and len(self._ids) == 0:  # type: ignore[arg-type]
+                    yield from data
+                    return
+            except Exception:
+                pass
             if not self._logged:
                 self._logged = True
                 try:
+                    n = "?"
+                    try:
+                        n = f"{len(self._ids):,}"  # type: ignore[arg-type]
+                    except Exception:
+                        n = "?"
                     print(
-                        f"[rank {rank}/{world_size} pid={os.getpid()}] ExcludeIdsFilter: enabled ids={len(self._ids):,} mixed={self._mixed}",
+                        f"[rank {rank}/{world_size} pid={os.getpid()}] ExcludeIdsFilter: enabled ids={n} mixed={self._mixed}",
                         file=sys.stderr,
                     )
                 except Exception:
@@ -1753,8 +1668,6 @@ def run_pipeline(
             name = (ds.get("name") or "").strip() or name
             if name == "<unknown>":
                 return 0
-            if only and name != only:
-                return 0
 
             _stage(f"start (config={cfg.get('_config_path','')})", dataset=name)
 
@@ -1765,47 +1678,33 @@ def run_pipeline(
 
             exec_cfg = cfg.get("executor") or {}
 
-            # --- fast resume guard (skip before any expensive work, including exclude-ids scan) ---
+            # --- always start clean (no resume/cache) ---
             ds_out = out_root / name
             logs_dir = out_root / "_logs" / name
 
-            want_full = (not prepare_only) and (not mixed_name)
-            want_prepare = bool(prepare or mixed_name)
+            want_full = not mixed_name
+            want_prepare = True
 
-            def _has_any_jsonl(folder: Path, pattern: str = "") -> bool:
-                if not folder.exists():
-                    return False
-                if pattern:
-                    return any(folder.glob(pattern))
-                return any(folder.glob("*.jsonl")) or any(folder.glob("*.jsonl.gz")) or any(folder.glob("*.jsonl.*"))
-
-            outputs_ok = True
-            if want_full and not _has_any_jsonl(ds_out):
-                outputs_ok = False
+            required_dirs: list[Path] = []
             if want_prepare:
                 if mixed_name:
-                    mixed_dir = out_root / "mixed" / mixed_name
-                    # In mixed mode, each dataset writes files named "<dataset>__${rank}.jsonl".
-                    if not _has_any_jsonl(mixed_dir, f"{name}__*.jsonl"):
-                        outputs_ok = False
+                    required_dirs.append(out_root / "mixed" / mixed_name)
                 else:
-                    prep_dir = out_root / "prepare" / name
-                    if not _has_any_jsonl(prep_dir):
-                        outputs_ok = False
+                    required_dirs.append(out_root / "prepare" / name)
+            if want_full:
+                required_dirs.append(ds_out)
 
-            if outputs_ok and not force:
-                print(f"[skip] {name}: outputs already exist; skipping (use --force to re-run)", file=sys.stderr)
-                return 0
+            prep_dir = out_root / "prepare" / name
+            cleanup_dirs = [logs_dir, ds_out, prep_dir]
+            for d in cleanup_dirs:
+                shutil.rmtree(d, ignore_errors=True)
+            logs_dir.mkdir(parents=True, exist_ok=True)
+            prep_dir.mkdir(parents=True, exist_ok=True)
+            if not mixed_name:
+                ds_out.mkdir(parents=True, exist_ok=True)
 
             # --- token budget (config-driven) ---
             def _cfg_token_budget() -> int | None:
-                if token_budget is not None:
-                    return int(token_budget)
-                if "token_budget" in exec_cfg:
-                    try:
-                        return int(exec_cfg.get("token_budget"))
-                    except Exception:
-                        return None
                 if "token_billions" in exec_cfg:
                     try:
                         b = float(exec_cfg.get("token_billions"))
@@ -1815,11 +1714,8 @@ def run_pipeline(
                 return None
 
             eff_token_budget = _cfg_token_budget()
-            eff_token_budget_parallel = bool(exec_cfg.get("token_budget_parallel", token_budget_parallel))
-            eff_seed = int(exec_cfg.get("seed", seed))
             eff_chars_per_token = float(exec_cfg.get("chars_per_token", chars_per_token))
-            token_budget_mode = str(exec_cfg.get("token_budget_mode", exec_cfg.get("token_mode", "")) or "").strip().lower()
-            global_pool_enabled = bool(exec_cfg.get("global_token_pool", False)) or (token_budget_mode == "global_pool")
+            global_pool_enabled = bool(eff_token_budget)
 
             # --- adapter ---
             adapter_kind = (cfg.get("adapter", {}) or {}).get("kind", "")
@@ -1835,11 +1731,9 @@ def run_pipeline(
                 name,
                 cfg.get("_config_path", ""),
                 system_ratio=float(system_ratio),
-                system_max_chars=int(system_max_chars),
-                seed=int(eff_seed),
             )
             _stage(
-                f"adapter={adapter_kind} system_ratio={float(system_ratio)} system_max_chars={int(system_max_chars)} seed={eff_seed}",
+                f"adapter={adapter_kind} system_ratio={float(system_ratio)}",
                 dataset=name,
             )
 
@@ -2036,26 +1930,25 @@ def run_pipeline(
                 return est_chars / max(eff_chars_per_token, 1e-6)
 
             # --- output file rolling ---
-            min_mb = float(exec_cfg.get("min_shard_mb", exec_cfg.get("min_mb", 2)))
             target_mb = float(exec_cfg.get("target_shard_mb", exec_cfg.get("target_mb", 2)))
-            min_bytes = int(min_mb * 1024 * 1024)
-            target_bytes = max(int(target_mb * 1024 * 1024), 1)
-            writer_max_file_size = -1 if total_bytes < min_bytes else target_bytes
+            if target_mb <= 0:
+                target_bytes = 0
+                writer_max_file_size = -1
+            else:
+                target_bytes = max(int(target_mb * 1024 * 1024), 1)
+                writer_max_file_size = target_bytes
 
             # --- tasks/workers planning ---
-            if tasks_override is not None:
-                tasks = int(tasks_override)
-            elif "tasks" in exec_cfg:
-                tasks = int(exec_cfg.get("tasks", 20))
+            if file_count <= 1 or target_bytes <= 0:
+                tasks = 1
             else:
-                if eff_token_budget and not eff_token_budget_parallel:
-                    tasks = 1
+                if eff_token_budget:
+                    # Estimate output bytes from token budget (chars_per_token is a heuristic).
+                    est_out_bytes = int(float(eff_token_budget) * float(eff_chars_per_token))
+                    est_out_bytes = min(int(total_bytes), max(1, est_out_bytes))
                 else:
-                    if total_bytes < min_bytes or file_count <= 1:
-                        tasks = 1
-                    else:
-                        default_tasks = int(exec_cfg.get("default_tasks", 20))
-                        tasks = max(1, min(file_count, default_tasks))
+                    est_out_bytes = int(total_bytes)
+                tasks = max(1, int(math.ceil(float(est_out_bytes) / float(target_bytes))))
 
             if (not global_pool_enabled) and file_count > 0 and tasks > file_count:
                 print(f"[warn] {name}: tasks={tasks} > input_files={file_count}; capping tasks to {file_count}", file=sys.stderr)
@@ -2105,7 +1998,7 @@ def run_pipeline(
                 stype0 = source.get("type")
                 if stype0 not in ("jsonl", "parquet"):
                     print(
-                        f"[warn] {name}: token_budget_mode=global_pool currently supports only jsonl sources; "
+                        f"[warn] {name}: global_pool currently supports only jsonl sources; "
                         f"falling back to per-rank limiter",
                         file=sys.stderr,
                     )
@@ -2124,9 +2017,7 @@ def run_pipeline(
                             out_dir=pool_dir,
                             tasks=tasks,
                             token_budget=int(eff_token_budget),
-                            seed=int(eff_seed),
                             chars_per_token=float(eff_chars_per_token),
-                            force=bool(force and (not reuse_pool)),
                         )
                     else:
                         # parquet -> jsonl pool shards (方案A), built in parallel
@@ -2149,10 +2040,8 @@ def run_pipeline(
                             out_dir=pool_dir,
                             tasks=tasks,
                             token_budget=int(eff_token_budget),
-                            seed=int(eff_seed),
                             chars_per_token=float(eff_chars_per_token),
                             build_workers=pool_workers,
-                            force=bool(force and (not reuse_pool)),
                         )
                     # Replace source to read from the pool shards, and disable per-rank budget limiter.
                     source = {"type": "jsonl", "data_dir": pool_dir.as_posix(), "glob": "pool_*.jsonl"}
@@ -2171,7 +2060,7 @@ def run_pipeline(
                         reader.limit = limit
 
             # --- pipeline ---
-            output_filename = "${rank}.jsonl" if not compression else "${rank}.jsonl.gz"
+            output_filename = "${rank}.jsonl"
             pipeline: list = [reader]
             if exclude_ids_dir:
                 ids = _get_blacklist_ids()
@@ -2181,7 +2070,7 @@ def run_pipeline(
                 per_rank_budget = int(eff_token_budget)
                 if tasks > 1:
                     per_rank_budget = max(1, (int(eff_token_budget) + tasks - 1) // tasks)
-                pipeline.append(TokenBudgetLimiter(per_rank_budget, seed=eff_seed, chars_per_token=eff_chars_per_token))
+                pipeline.append(TokenBudgetLimiter(per_rank_budget, chars_per_token=eff_chars_per_token))
 
             progress_cfg = exec_cfg.get("progress") or {}
             if not isinstance(progress_cfg, dict):
@@ -2198,88 +2087,43 @@ def run_pipeline(
                     )
                 )
 
-            if not prepare_only and not mixed_name:
+            if not mixed_name:
                 pipeline.append(
                     StdJsonlWriter(
                         str(ds_out),
                         output_filename=output_filename,
-                        compression=compression,
-                        max_file_size=writer_max_file_size,
-                    )
-                )
-
-            if prepare or mixed_name:
-                if mixed_name:
-                    prepare_out = out_root / "mixed" / mixed_name
-                else:
-                    prepare_out = out_root / "prepare" / name
-                prepare_out.mkdir(parents=True, exist_ok=True)
-
-                def _prepare_adapter(self, document):  # noqa: ANN001
-                    uid = str(getattr(document, "id", ""))
-                    if mixed_name:
-                        uid = f"{name}::{uid}"
-                    return {"uuid": uid, "text": getattr(document, "text", "")}
-
-                prepare_filename = f"{name}__${{rank}}.jsonl" if mixed_name else "${rank}.jsonl"
-                pipeline.append(
-                    StdJsonlWriter(
-                        str(prepare_out),
-                        output_filename=prepare_filename,
                         compression=None,
-                        adapter=_prepare_adapter,
                         max_file_size=writer_max_file_size,
                     )
                 )
 
-            required_dirs: list[Path] = []
-            if want_prepare:
-                if mixed_name:
-                    required_dirs.append(out_root / "mixed" / mixed_name)
-                else:
-                    required_dirs.append(out_root / "prepare" / name)
-            if want_full:
-                required_dirs.append(ds_out)
-
-            outputs_ok = True
-            for d in required_dirs:
-                if not _has_any_jsonl(d):
-                    outputs_ok = False
-                    break
-
-            if force:
-                print(f"[force] {name}: deleting {logs_dir} and existing outputs", file=sys.stderr)
-                try:
-                    shutil.rmtree(logs_dir, ignore_errors=True)
-                except Exception:
-                    pass
-                for d in required_dirs:
-                    try:
-                        shutil.rmtree(d, ignore_errors=True)
-                    except Exception:
-                        pass
-                logs_dir.mkdir(parents=True, exist_ok=True)
-                if prepare:
-                    (out_root / "prepare" / name).mkdir(parents=True, exist_ok=True)
-                if not prepare_only:
-                    ds_out.mkdir(parents=True, exist_ok=True)
+            if mixed_name:
+                prepare_out = out_root / "mixed" / mixed_name
             else:
-                if logs_dir.exists() and not outputs_ok:
-                    print(f"[warn] {name}: outputs missing but logs exist; clearing {logs_dir} to re-run", file=sys.stderr)
-                    try:
-                        shutil.rmtree(logs_dir, ignore_errors=True)
-                    except Exception:
-                        pass
-                    logs_dir.mkdir(parents=True, exist_ok=True)
+                prepare_out = out_root / "prepare" / name
+            prepare_out.mkdir(parents=True, exist_ok=True)
+
+            def _prepare_adapter(self, document):  # noqa: ANN001
+                uid = str(getattr(document, "id", ""))
+                if mixed_name:
+                    uid = f"{name}::{uid}"
+                return {"uuid": uid, "text": getattr(document, "text", "")}
+
+            prepare_filename = f"{name}__${{rank}}.jsonl" if mixed_name else "${rank}.jsonl"
+            pipeline.append(
+                StdJsonlWriter(
+                    str(prepare_out),
+                    output_filename=prepare_filename,
+                    compression=None,
+                    adapter=_prepare_adapter,
+                    max_file_size=writer_max_file_size,
+                )
+            )
 
             glob_desc = pattern if pattern else (";".join(globs_for_stats) if globs_for_stats else "")
             tb = f"{eff_token_budget}" if eff_token_budget else "0"
             tb_mode = "split" if (eff_token_budget and tasks > 1) else ("global" if eff_token_budget else "off")
-            out_mode = (
-                f"mixed:{mixed_name}"
-                if mixed_name
-                else ("prepare-only" if prepare_only else ("prepare+full" if prepare else "full"))
-            )
+            out_mode = f"mixed:{mixed_name}" if mixed_name else "prepare+full"
             total_mb_str = f"{(total_bytes / (1024 * 1024)):.1f}MB" if total_bytes else "0MB"
             start_method = str(exec_cfg.get("start_method", exec_cfg.get("mp_start_method", "forkserver")) or "").strip()
             if start_method not in {"forkserver", "fork", "spawn"}:
@@ -2334,7 +2178,7 @@ def run_pipeline(
             # --- postprocess: merge outputs to a target number of files ---
             merge_to = int(exec_cfg.get("merge_to_files", exec_cfg.get("merge_outputs_to_files", 0)) or 0)
             if merge_to > 0:
-                keep_inputs = bool(exec_cfg.get("merge_keep_inputs", False))
+                keep_inputs = True
                 for d in required_dirs:
                     try:
                         # Merge is intentionally single-process and I/O-bound; log it explicitly to avoid confusion
@@ -2374,53 +2218,8 @@ def run_pipeline(
             print(traceback.format_exc(), file=sys.stderr)
             return 1
 
-    dataset_parallelism = max(1, int(dataset_parallelism))
-    if dataset_parallelism == 1:
-        for cfg in cfgs:
-            rc = _run_one(cfg)
-            if rc != 0:
-                return rc
-        return 0
-
-    # Run multiple datasets concurrently to reduce "tail" idle time across datasets.
-    # We use threads here (not a process pool) because each dataset run launches its own multiprocessing
-    # work via LocalPipelineExecutor; threading avoids pickling constraints and is stable on Linux/WSL.
-    # Important: keep total concurrency reasonable to avoid oversubscribing CPU/disk.
-    cfgs_run: list[dict] = []
     for cfg in cfgs:
-        ds = cfg.get("dataset", {})
-        name = (ds.get("name") or "").strip()
-        if not name:
-            continue
-        if only and name != only:
-            continue
-        cfgs_run.append(cfg)
-
-    if not cfgs_run:
-        return 0
-
-    print(f"[info] dataset_parallelism={dataset_parallelism}: running {len(cfgs_run)} dataset(s) concurrently", file=sys.stderr)
-
-    first_err = 0
-    with ThreadPoolExecutor(max_workers=dataset_parallelism) as ex:
-        fut_to_name = {}
-        for cfg in cfgs_run:
-            ds = cfg.get("dataset", {})
-            name = (ds.get("name") or "").strip() or "<unknown>"
-            fut = ex.submit(_run_one, cfg)
-            fut_to_name[fut] = name
-
-        for fut in as_completed(fut_to_name):
-            name = fut_to_name[fut]
-            try:
-                rc = int(fut.result())
-            except Exception:
-                print(f"[error] {name}: crashed (dataset thread)", file=sys.stderr)
-                print(traceback.format_exc(), file=sys.stderr)
-                first_err = first_err or 1
-                continue
-            if rc != 0:
-                print(f"[error] {name}: exited with {rc}", file=sys.stderr)
-                first_err = first_err or rc
-
-    return int(first_err or 0)
+        rc = _run_one(cfg)
+        if rc != 0:
+            return rc
+    return 0
