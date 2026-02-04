@@ -39,6 +39,7 @@ PYTHONPATH=src python -m cli.runner \
 - **`--system-ratio`**：按比例把 `raw.system`（工具/规范说明）拼进 `text`（按 doc id 稳定抽样）；`0` 关闭
 - **`--mixed NAME`**：mixed 模式：所有数据集写到同一个目录 `<out-root>/mixed/NAME/`
 - **`--exclude-ids-dir DIR`**：加载黑名单 id/uuid：递归扫描 DIR 下所有文件，收集每行 JSON 的 `uuid/id/doc_id`（或纯文本行）；新输出会跳过这些 id（每次执行都会重新扫描）
+- **`--disable-pool`**：禁用 token 预算下的全量池化（直接从输入抽样）
 - **`--limit N`**：调试用：限制文档条数（`-1` 为全量）
 
 ## 配置格式（通用）
@@ -90,6 +91,8 @@ PYTHONPATH=src python -m cli.runner \
 - **按 token 预算抽样（配置内控制；CLI 不再提供 `-B`）**：
   - `token_billions`：目标 B（float；内部乘以 1e9）
   - `chars_per_token`：token 估算系数（默认 4.0）
+  - 默认会先做全量池化（可用 `--disable-pool` 关闭）
+  - 池化时会按估算概率随机抽样，避免样本集中在少数文件
 
 - **后处理（输出文件合并）**：
   - `merge_to_files`（可选，int）：datatrove 跑完后，把输出目录下的 `*.jsonl` / `*.jsonl.gz` **合并**成指定数量的文件（例如 1）。

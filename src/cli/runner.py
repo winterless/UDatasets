@@ -177,6 +177,11 @@ def main(argv: list[str] | None = None) -> int:
         "Any new documents whose id/uuid is in that blacklist will be skipped. Works with prepare and mixed mode.",
     )
     ap.add_argument(
+        "--disable-pool",
+        action="store_true",
+        help="Disable full-pool build when token_billions is set; sample directly from inputs instead.",
+    )
+    ap.add_argument(
         "--workers",
         type=int,
         default=None,
@@ -205,6 +210,7 @@ def main(argv: list[str] | None = None) -> int:
         out_root=out_root,
         workers_override=args.workers,
         limit=args.limit,
+        disable_pool=bool(args.disable_pool),
         system_ratio=float(args.system_ratio),
         mixed_name=str(args.mixed or "").strip(),
         exclude_ids_dir=(str(Path(args.exclude_ids_dir).expanduser().resolve()) if args.exclude_ids_dir else ""),

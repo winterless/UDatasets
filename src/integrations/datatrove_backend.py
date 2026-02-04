@@ -207,17 +207,23 @@ def _global_pool_sample_jsonl_to_shards(
     tasks: int,
     token_budget: int,
     chars_per_token: float,
+    sample_prob: float,
 ) -> Path:
     """
     Build a "global pool" sample across ALL input files, then split into `tasks` shard files.
 
     Behavior:
-    - Shuffle input_files, then stream lines until token_budget reached.
+    - Shuffle input_files, then stream all lines (optionally downsample).
     - Uses adapter-produced `text` length to estimate tokens (same heuristic as TokenBudgetLimiter).
     - Writes raw JSON lines into `out_dir/pool_${rank}.jsonl`, so datatrove can re-read and adapt normally.
     """
     tasks = max(1, int(tasks))
     token_budget = max(1, int(token_budget))
+    sample_prob = float(sample_prob)
+    if sample_prob <= 0:
+        sample_prob = 0.0
+    if sample_prob >= 1:
+        sample_prob = 1.0
     chars_per_token = float(chars_per_token)
     chars_per_token = 4.0 if chars_per_token <= 0 else chars_per_token
 
@@ -242,6 +248,7 @@ def _global_pool_sample_jsonl_to_shards(
 
     files = list(input_files)
     random.shuffle(files)
+    rng = random.Random()
 
     if not files:
         print(f"[warn] {dataset_name}: global_pool has 0 input files; skipping", file=sys.stderr)
@@ -271,8 +278,6 @@ def _global_pool_sample_jsonl_to_shards(
             try:
                 with fp.open("rb") as f:
                     for li, raw_line in enumerate(f):
-                        if total_tok >= token_budget:
-                            break
                         b = raw_line.strip()
                         if not b:
                             continue
@@ -298,6 +303,8 @@ def _global_pool_sample_jsonl_to_shards(
                         t = _est_tokens(text)
                         if t <= 0:
                             continue
+                        if sample_prob < 1.0 and rng.random() > sample_prob:
+                            continue
                         # write original line (raw record) to a shard
                         r = rr % tasks
                         rr += 1
@@ -311,12 +318,11 @@ def _global_pool_sample_jsonl_to_shards(
                             print(
                                 f"[info] {dataset_name}: global_pool building... "
                                 f"files={files_done}/{len(files)} docs={total_docs:,} bad={total_bad:,} "
-                                f"tok≈{total_tok:,}/{token_budget:,} rate≈{(total_docs/dt):,.1f} docs/s",
+                                f"tok≈{total_tok:,} budget={token_budget:,} sample_p={sample_prob:.4f} "
+                                f"rate≈{(total_docs/dt):,.1f} docs/s",
                                 file=sys.stderr,
                             )
                             last_log = now
-                    if total_tok >= token_budget:
-                        break
             except Exception:
                 total_bad += 1
                 continue
@@ -324,7 +330,7 @@ def _global_pool_sample_jsonl_to_shards(
         dt = max(time.monotonic() - t0, 1e-6)
         print(
             f"[info] {dataset_name}: global_pool built shards={tasks} docs={total_docs:,} bad={total_bad:,} "
-            f"tok≈{total_tok:,}/{token_budget:,} in {dt:.1f}s",
+            f"tok≈{total_tok:,} budget={token_budget:,} sample_p={sample_prob:.4f} in {dt:.1f}s",
             file=sys.stderr,
         )
     finally:
@@ -341,6 +347,7 @@ def _global_pool_sample_jsonl_to_shards(
                 "tasks": tasks,
                 "token_budget": token_budget,
                 "chars_per_token": float(chars_per_token),
+                "sample_prob": float(sample_prob),
                 "docs": int(total_docs),
                 "tokens_est": int(total_tok),
                 "bad": int(total_bad),
@@ -459,8 +466,8 @@ def _pool_worker_parquet_to_shards(
     dataset_name: str,
     out_dir: str,
     tasks: int,
-    token_budget: int,
     chars_per_token: float,
+    sample_prob: float,
     batch_size: int = 1024,
 ) -> dict:
     """
@@ -477,9 +484,13 @@ def _pool_worker_parquet_to_shards(
         return {"worker": worker_idx, "docs": 0, "tokens": 0, "bad": 0, "error": f"unknown adapter: {adapter_kind}"}
 
     tasks = max(1, int(tasks))
-    token_budget = max(1, int(token_budget))
     chars_per_token = 4.0 if float(chars_per_token) <= 0 else float(chars_per_token)
     rng = random.Random()
+    sample_prob = float(sample_prob)
+    if sample_prob <= 0:
+        sample_prob = 0.0
+    if sample_prob >= 1:
+        sample_prob = 1.0
 
     outp = Path(out_dir)
     outp.mkdir(parents=True, exist_ok=True)
@@ -497,8 +508,6 @@ def _pool_worker_parquet_to_shards(
 
     try:
         for fp in files:
-            if tokens >= token_budget:
-                break
             try:
                 pf = pq.ParquetFile(fp)
             except Exception:
@@ -508,16 +517,12 @@ def _pool_worker_parquet_to_shards(
             row_idx = 0
             try:
                 for batch in pf.iter_batches(batch_size=int(batch_size)):
-                    if tokens >= token_budget:
-                        break
                     try:
                         rows = batch.to_pylist()
                     except Exception:
                         bad += 1
                         continue
                     for row in rows:
-                        if tokens >= token_budget:
-                            break
                         row_idx += 1
                         if not isinstance(row, dict):
                             row = {"value": row}
@@ -536,6 +541,8 @@ def _pool_worker_parquet_to_shards(
                         t = _est_tokens(text)
                         if t <= 0:
                             continue
+                        if sample_prob < 1.0 and rng.random() > sample_prob:
+                            continue
                         # write raw row (not doc) so datatrove can re-adapt normally
                         try:
                             line = (json.dumps(row, ensure_ascii=False) + "\n").encode("utf-8")
@@ -547,8 +554,6 @@ def _pool_worker_parquet_to_shards(
                         outs[r].write(line)
                         docs += 1
                         tokens += t
-                        if tokens >= token_budget:
-                            break
             except Exception:
                 bad += 1
                 continue
@@ -572,6 +577,7 @@ def _global_pool_sample_parquet_to_shards(
     token_budget: int,
     chars_per_token: float,
     build_workers: int,
+    sample_prob: float,
 ) -> Path:
     """
     Parquet global pool (方案A): sample from parquet and write `tasks` JSONL shard files, then datatrove reads JSONL.
@@ -582,6 +588,11 @@ def _global_pool_sample_parquet_to_shards(
     tasks = max(1, int(tasks))
     build_workers = max(1, int(build_workers))
     token_budget = max(1, int(token_budget))
+    sample_prob = float(sample_prob)
+    if sample_prob <= 0:
+        sample_prob = 0.0
+    if sample_prob >= 1:
+        sample_prob = 1.0
     out_dir.mkdir(parents=True, exist_ok=True)
     marker = out_dir / "_DONE"
     shard_paths = [out_dir / f"pool_{r:05d}.jsonl" for r in range(tasks)]
@@ -609,7 +620,7 @@ def _global_pool_sample_parquet_to_shards(
         marker.write_text(json.dumps({"dataset": dataset_name, "tasks": tasks, "token_budget": token_budget, "docs": 0}) + "\n")
         return out_dir
 
-    # split budget exactly across workers
+    # split files across workers for better balance
     w = min(build_workers, len(files))
     if build_workers > 1 and len(files) == 1:
         # Important UX note: our parallelism here is per-input-file, so a single huge parquet cannot be sped up
@@ -620,9 +631,6 @@ def _global_pool_sample_parquet_to_shards(
             f"Tip: split the parquet into many files to enable real parallel read/convert.",
             file=sys.stderr,
         )
-    base = token_budget // w
-    rem = token_budget % w
-    budgets = [(base + 1) if i < rem else base for i in range(w)]
 
     # split files across workers (round-robin) for better balance
     file_lists: list[list[str]] = [[] for _ in range(w)]
@@ -635,7 +643,8 @@ def _global_pool_sample_parquet_to_shards(
 
     t0 = time.monotonic()
     print(
-        f"[info] {dataset_name}: global_pool(parquet) building in parallel: pool_workers={w} tasks={tasks} token_budget={token_budget:,}",
+        f"[info] {dataset_name}: global_pool(parquet) building in parallel: pool_workers={w} tasks={tasks} "
+        f"budget={token_budget:,} sample_p={sample_prob:.4f}",
         file=sys.stderr,
     )
     total_docs = 0
@@ -653,8 +662,8 @@ def _global_pool_sample_parquet_to_shards(
                 dataset_name=dataset_name,
                 out_dir=outw,
                 tasks=tasks,
-                token_budget=budgets[wi],
                 chars_per_token=float(chars_per_token),
+                sample_prob=float(sample_prob),
             )
             futs[fut] = wi
 
@@ -696,7 +705,7 @@ def _global_pool_sample_parquet_to_shards(
     dt = max(time.monotonic() - t0, 1e-6)
     print(
         f"[info] {dataset_name}: global_pool(parquet) built shards={tasks} docs={total_docs:,} bad={total_bad:,} "
-        f"tok≈{total_tok:,}/{token_budget:,} in {dt:.1f}s",
+        f"tok≈{total_tok:,} budget={token_budget:,} sample_p={sample_prob:.4f} in {dt:.1f}s",
         file=sys.stderr,
     )
     marker.write_text(
@@ -706,6 +715,7 @@ def _global_pool_sample_parquet_to_shards(
                 "tasks": tasks,
                 "token_budget": token_budget,
                 "chars_per_token": float(chars_per_token),
+                "sample_prob": float(sample_prob),
                 "pool_workers": int(w),
                 "docs": int(total_docs),
                 "tokens_est": int(total_tok),
@@ -1209,6 +1219,7 @@ def run_pipeline(
     out_root: str | Path,
     workers_override: int | None = None,
     limit: int = -1,
+    disable_pool: bool = False,
     mixed_name: str = "",
     exclude_ids_dir: str = "",
     system_ratio: float = 0.0,
@@ -1715,7 +1726,7 @@ def run_pipeline(
 
             eff_token_budget = _cfg_token_budget()
             eff_chars_per_token = float(exec_cfg.get("chars_per_token", chars_per_token))
-            global_pool_enabled = bool(eff_token_budget)
+            global_pool_enabled = bool(eff_token_budget) and (not disable_pool)
 
             # --- adapter ---
             adapter_kind = (cfg.get("adapter", {}) or {}).get("kind", "")
@@ -1949,6 +1960,11 @@ def run_pipeline(
                 else:
                     est_out_bytes = int(total_bytes)
                 tasks = max(1, int(math.ceil(float(est_out_bytes) / float(target_bytes))))
+            if eff_token_budget and total_bytes > 0:
+                total_tokens_est = max(1, int(float(total_bytes) / max(float(eff_chars_per_token), 1e-6)))
+                sample_prob = min(1.0, float(eff_token_budget) / float(total_tokens_est))
+            else:
+                sample_prob = 1.0
 
             if (not global_pool_enabled) and file_count > 0 and tasks > file_count:
                 print(f"[warn] {name}: tasks={tasks} > input_files={file_count}; capping tasks to {file_count}", file=sys.stderr)
@@ -2005,7 +2021,7 @@ def run_pipeline(
                 else:
                     pool_dir = out_root / "_pool" / name
                     _stage(
-                        f"global_pool sampling enabled: token_budget={int(eff_token_budget):,} tasks={tasks} "
+                        f"global_pool build enabled: token_budget={int(eff_token_budget):,} tasks={tasks} "
                         f"(writes to {pool_dir})",
                         dataset=name,
                     )
@@ -2018,6 +2034,7 @@ def run_pipeline(
                             tasks=tasks,
                             token_budget=int(eff_token_budget),
                             chars_per_token=float(eff_chars_per_token),
+                            sample_prob=float(sample_prob),
                         )
                     else:
                         # parquet -> jsonl pool shards (方案A), built in parallel
@@ -2042,8 +2059,9 @@ def run_pipeline(
                             token_budget=int(eff_token_budget),
                             chars_per_token=float(eff_chars_per_token),
                             build_workers=pool_workers,
+                            sample_prob=float(sample_prob),
                         )
-                    # Replace source to read from the pool shards, and disable per-rank budget limiter.
+                    # Replace source to read from the pool shards.
                     source = {"type": "jsonl", "data_dir": pool_dir.as_posix(), "glob": "pool_*.jsonl"}
                     base = Path(source["data_dir"])
                     matched_files = sorted(list(base.glob(source["glob"])))
@@ -2052,7 +2070,6 @@ def run_pipeline(
                         total_bytes = sum(p.stat().st_size for p in matched_files if p.is_file())
                     except Exception:
                         total_bytes = 0
-                    eff_token_budget = None
                     _stage(f"global_pool ready: shard_files={file_count} size≈{(total_bytes/(1024**2)):.1f}MB", dataset=name)
                     # Rebuild reader to point at the pool dir (do not reuse old reader/paths_file).
                     reader = build_reader(source, datasets_root, adapter_fn, paths_file=None)
