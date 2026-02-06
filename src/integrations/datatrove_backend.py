@@ -1137,6 +1137,9 @@ def make_adapter(
 ):
     def _adapter(self, data, path, id_in_file):
         doc = base_adapter(self, data, path, id_in_file)
+        if not isinstance(doc, dict) or doc.get("_skip"):
+            # Return an empty document so upstream reader can safely drop it.
+            return {"text": ""}
         # Optionally mix in tool/spec instructions from raw["system"] for a subset of samples.
         # Selection is stable across parallelism/order via doc_id hashing.
         if system_ratio and system_ratio > 0:

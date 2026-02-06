@@ -17,7 +17,7 @@ JsonDict = Dict[str, Any]
 
 def _ensure_text(text: str | None) -> str:
     t = (text or "").strip()
-    return t if t else "[NO_TEXT]"
+    return t if t else ""
 
 
 def _stable_id_from_path(path: str, id_in_file: int | str) -> str:
@@ -31,12 +31,38 @@ def toucan_adapter(self, data: JsonDict, path: str, id_in_file: int | str) -> Js
 
     msg_field = raw.get("messages")
     text = ""
+    def _has_duplicate_function_call(msgs: list[dict]) -> bool:
+        seen: set[str] = set()
+        for m in msgs:
+            if not isinstance(m, dict):
+                continue
+            fc = m.get("function_call")
+            if fc is None:
+                continue
+            if isinstance(fc, (dict, list)):
+                try:
+                    key = json.dumps(fc, sort_keys=True, ensure_ascii=False)
+                except Exception:
+                    key = str(fc)
+            else:
+                key = str(fc)
+            if key in seen:
+                return True
+            seen.add(key)
+        return False
+
     if isinstance(msg_field, str):
         try:
             msgs = json.loads(msg_field)
         except Exception:
             msgs = None
         if isinstance(msgs, list):
+            if _has_duplicate_function_call([m for m in msgs if isinstance(m, dict)]):
+                return {
+                    "_skip": True,
+                    "id": doc_id,
+                    "metadata": {"dataset": "Toucan-1.5M", "raw": raw, "skip_reason": "duplicate_function_call"},
+                }
             lines = []
             for m in msgs:
                 if not isinstance(m, dict):
@@ -50,6 +76,12 @@ def toucan_adapter(self, data: JsonDict, path: str, id_in_file: int | str) -> Js
                     lines.append(f"{role}.function_call: {fc}")
             text = "\n".join(lines)
     elif isinstance(msg_field, list):
+        if _has_duplicate_function_call([m for m in msg_field if isinstance(m, dict)]):
+            return {
+                "_skip": True,
+                "id": doc_id,
+                "metadata": {"dataset": "Toucan-1.5M", "raw": raw, "skip_reason": "duplicate_function_call"},
+            }
         lines = []
         for m in msg_field:
             if not isinstance(m, dict):
