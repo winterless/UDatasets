@@ -51,6 +51,37 @@ def toucan_adapter(self, data: JsonDict, path: str, id_in_file: int | str) -> Js
             seen.add(key)
         return False
 
+    def _format_role_block(role: str, content: str) -> str:
+        role_s = role.strip() if isinstance(role, str) else ""
+        return f"<|{role_s}|>\n{content}".strip() if role_s else content
+
+    def _format_tool_call(fc: object) -> str:
+        if isinstance(fc, dict):
+            try:
+                payload = json.dumps(fc, ensure_ascii=False, sort_keys=True)
+            except Exception:
+                payload = str(fc)
+        else:
+            payload = str(fc)
+        return f"<|tool_call|>\n{payload}\n</|tool_call|>"
+
+    def _format_messages(msgs: list[dict]) -> str:
+        parts: list[str] = []
+        for m in msgs:
+            if not isinstance(m, dict):
+                continue
+            role = m.get("role", "") or ""
+            content = m.get("content", "")
+            if isinstance(content, str) and content.strip():
+                parts.append(_format_role_block(role, content.strip()))
+            fc = m.get("function_call")
+            if fc is not None:
+                parts.append(_format_tool_call(fc))
+            # Tool return content: prefer role "tool"/"function" if present.
+            if role in ("tool", "function") and isinstance(content, str) and content.strip():
+                parts[-1] = _format_role_block("tool_output", content.strip())
+        return "\n\n".join(parts).strip()
+
     if isinstance(msg_field, str):
         try:
             msgs = json.loads(msg_field)
@@ -63,18 +94,7 @@ def toucan_adapter(self, data: JsonDict, path: str, id_in_file: int | str) -> Js
                     "id": doc_id,
                     "metadata": {"dataset": "Toucan-1.5M", "raw": raw, "skip_reason": "duplicate_function_call"},
                 }
-            lines = []
-            for m in msgs:
-                if not isinstance(m, dict):
-                    continue
-                role = m.get("role", "")
-                content = m.get("content", "")
-                if isinstance(content, str) and content.strip():
-                    lines.append(f"{role}: {content}".strip())
-                fc = m.get("function_call")
-                if fc is not None:
-                    lines.append(f"{role}.function_call: {fc}")
-            text = "\n".join(lines)
+            text = _format_messages([m for m in msgs if isinstance(m, dict)])
     elif isinstance(msg_field, list):
         if _has_duplicate_function_call([m for m in msg_field if isinstance(m, dict)]):
             return {
@@ -82,15 +102,7 @@ def toucan_adapter(self, data: JsonDict, path: str, id_in_file: int | str) -> Js
                 "id": doc_id,
                 "metadata": {"dataset": "Toucan-1.5M", "raw": raw, "skip_reason": "duplicate_function_call"},
             }
-        lines = []
-        for m in msg_field:
-            if not isinstance(m, dict):
-                continue
-            role = m.get("role", "")
-            content = m.get("content", "")
-            if isinstance(content, str) and content.strip():
-                lines.append(f"{role}: {content}".strip())
-        text = "\n".join(lines)
+        text = _format_messages([m for m in msg_field if isinstance(m, dict)])
 
     if not text and isinstance(raw.get("question"), str):
         text = raw["question"]
