@@ -10,6 +10,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+from datetime import datetime, timezone
 import shutil
 
 
@@ -204,7 +205,7 @@ def main(argv: list[str] | None = None) -> int:
         shard_jsonl_mb=float(args.shard_jsonl_mb),
     )
 
-    return run_pipeline(
+    rc = run_pipeline(
         datasets_root=datasets_root,
         config_dir=config_dir,
         out_root=out_root,
@@ -215,6 +216,14 @@ def main(argv: list[str] | None = None) -> int:
         mixed_name=str(args.mixed or "").strip(),
         exclude_ids_dir=(str(Path(args.exclude_ids_dir).expanduser().resolve()) if args.exclude_ids_dir else ""),
     )
+    if rc == 0:
+        try:
+            marker = Path(out_root) / "_DONE"
+            ts = datetime.now(timezone.utc).isoformat()
+            marker.write_text(f"completed_at_utc: {ts}\n", encoding="utf-8")
+        except Exception:
+            pass
+    return rc
 
 
 if __name__ == "__main__":
