@@ -2231,6 +2231,45 @@ def run_pipeline(
                     except Exception:
                         print(f"[warn] {name}: post-merge failed for {d}", file=sys.stderr)
                         print(traceback.format_exc(), file=sys.stderr)
+            # --- postprocess: dataset-level augmentations ---
+            try:
+                post_cfg = cfg.get("postprocess") or {}
+                kinds: list = []
+                if isinstance(post_cfg, dict):
+                    if post_cfg.get("kinds"):
+                        raw = post_cfg.get("kinds")
+                        kinds = raw if isinstance(raw, list) else [raw]
+                    elif post_cfg.get("kind"):
+                        kinds = [post_cfg.get("kind")]
+                elif isinstance(post_cfg, list):
+                    kinds = post_cfg
+                kinds = [k for k in kinds if k]
+                if kinds:
+                    from pipelines.postprocess import run_postprocess, write_pretty_txt_for_dir
+
+                    out_subdir = str(post_cfg.get("output_subdir", "prepare_aug")).strip() if isinstance(post_cfg, dict) else "prepare_aug"
+                    prepare_dir = Path(out_root) / "prepare" / name
+                    if prepare_dir.exists():
+                        out_dir = Path(out_root) / out_subdir / name
+                        cur_in = prepare_dir
+                        for i, k in enumerate(kinds):
+                            if isinstance(k, dict):
+                                kind = str(k.get("kind", "")).strip()
+                                cfg_item = k
+                            else:
+                                kind = str(k).strip()
+                                cfg_item = post_cfg if isinstance(post_cfg, dict) else {}
+                            if not kind:
+                                continue
+                            run_postprocess(kind, cur_in if i == 0 else out_dir, out_dir, config=cfg_item)
+                            cur_in = out_dir
+                        print(f"[post] {name}: postprocess={','.join(str(x) for x in kinds)} -> {out_dir}", file=sys.stderr)
+                        if isinstance(post_cfg, dict) and post_cfg.get("pretty_txt"):
+                            write_pretty_txt_for_dir(out_dir)
+            except Exception:
+                print(f"[warn] {name}: postprocess failed", file=sys.stderr)
+                print(traceback.format_exc(), file=sys.stderr)
+
             print(f"[ok] {name} -> {ds_out}", file=sys.stderr)
             return 0
         except Exception:
