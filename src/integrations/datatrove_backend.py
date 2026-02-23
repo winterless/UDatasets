@@ -2271,10 +2271,22 @@ def run_pipeline(
                                     f"[post] {name}: running kind={kind} input={prepare_dir} output={out_dir}",
                                     file=sys.stderr,
                                 )
-                                run_postprocess(kind, prepare_dir, out_dir, config=cfg_item)
+                                run_postprocess(
+                                    kind,
+                                    prepare_dir,
+                                    out_dir,
+                                    config=cfg_item,
+                                    workers_override=workers_override,
+                                )
                                 continue
                             print(f"[post] {name}: running kind={kind} input={cur_in} output={out_dir}", file=sys.stderr)
-                            run_postprocess(kind, cur_in, out_dir, config=cfg_item)
+                            run_postprocess(
+                                kind,
+                                cur_in,
+                                out_dir,
+                                config=cfg_item,
+                                workers_override=workers_override,
+                            )
                             cur_in = out_dir
                         print(f"[post] {name}: postprocess={','.join(str(x) for x in kinds)} -> {out_dir}", file=sys.stderr)
                         if isinstance(post_cfg, dict) and post_cfg.get("pretty_txt"):

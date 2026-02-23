@@ -13,13 +13,12 @@
     "kind": "toucan"
   },
   "executor": {
-    "target_shard_mb": 0.5,
-    "token_billions": 0.001
+    "target_shard_mb": 5
   },
   "postprocess": {
     "kinds": ["param_pool", "tool_mcq"],
     "output_subdir": "prepare_aug",
-    "max_mcq": 1,
+    "mcq_every_n": 5,
     "pretty_txt": true
   },
   "enabled": true
