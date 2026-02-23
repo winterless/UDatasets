@@ -49,6 +49,33 @@ def _extract_tools_from_text(text: str) -> list[dict]:
     return tools
 
 
+def _extract_tool_call_names(text: str) -> list[str]:
+    names: list[str] = []
+    pos = 0
+    while True:
+        start = text.find(TOOL_CALL_START, pos)
+        if start == -1:
+            break
+        end = text.find(TOOL_CALL_END, start)
+        if end == -1:
+            break
+        payload = text[start + len(TOOL_CALL_START) : end]
+        call = _parse_tool_call_payload(payload)
+        if call:
+            name = call.get("name") if isinstance(call.get("name"), str) else ""
+            if name:
+                names.append(name)
+        pos = end + len(TOOL_CALL_END)
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for n in names:
+        if n in seen:
+            continue
+        seen.add(n)
+        uniq.append(n)
+    return uniq
+
+
 def _tool_name(tool: dict) -> str:
     func = tool.get("function")
     if isinstance(func, dict):
@@ -577,6 +604,8 @@ def augment_tool_mcq_record(
 ) -> str:
     tools = _extract_tools_from_text(text)
     tool_names = [n for n in (_tool_name(t) for t in tools) if n]
+    if len(tool_names) < 2:
+        tool_names = _extract_tool_call_names(text)
     tool_schema_map: dict[str, tuple[list[str], dict]] = {}
     for t in tools:
         name = _tool_name(t)
@@ -652,6 +681,8 @@ def augment_tool_mcq_record_all(
 ) -> str:
     tools = _extract_tools_from_text(text)
     tool_names = [n for n in (_tool_name(t) for t in tools) if n]
+    if len(tool_names) < 2:
+        tool_names = _extract_tool_call_names(text)
     tool_schema_map: dict[str, tuple[list[str], dict]] = {}
     for t in tools:
         name = _tool_name(t)
