@@ -17,7 +17,7 @@
     "token_billions": 0.001
   },
   "postprocess": {
-    "kind": "tool_mcq",
+    "kinds": ["param_pool", "tool_mcq"],
     "output_subdir": "prepare_aug",
     "max_mcq": 1,
     "pretty_txt": true

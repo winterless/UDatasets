@@ -4,6 +4,7 @@ import json
 import random
 import re
 import shutil
+from collections import defaultdict
 from pathlib import Path
 from typing import Any, Callable
 
@@ -67,6 +68,19 @@ def _tool_required_params(tool: dict) -> list[str]:
     return []
 
 
+def _tool_param_schema(tool: dict) -> tuple[list[str], dict]:
+    func = tool.get("function")
+    if not isinstance(func, dict):
+        return ([], {})
+    params = func.get("parameters")
+    if not isinstance(params, dict):
+        return ([], {})
+    required = params.get("required") or []
+    req_list = [str(x) for x in required if isinstance(x, (str, int))]
+    props = params.get("properties") or {}
+    return (req_list, props if isinstance(props, dict) else {})
+
+
 def _parse_tool_call_payload(payload: str) -> dict | None:
     payload = payload.strip()
     if not payload:
@@ -81,6 +95,21 @@ def _parse_tool_call_payload(payload: str) -> dict | None:
             return obj if isinstance(obj, dict) else None
         except Exception:
             return None
+
+
+def _parse_tool_call_arguments(call: dict | None) -> dict | None:
+    if not isinstance(call, dict):
+        return None
+    args = call.get("arguments")
+    if isinstance(args, dict):
+        return args
+    if isinstance(args, str):
+        try:
+            parsed = json.loads(args)
+            return parsed if isinstance(parsed, dict) else None
+        except Exception:
+            return None
+    return None
 
 
 def _render_mcq_tool(name: str, options: list[str], correct_idx: int) -> str:
@@ -112,31 +141,295 @@ def _render_mcq_params(required: list[str], options: list[str], correct_idx: int
     return "\n".join(lines)
 
 
-def augment_tool_mcq_record(text: str, *, seed: int = 0, max_mcq: int = 3) -> str:
+def _render_mcq_param_values(options: list[str], correct_idx: int) -> str:
+    letters = "ABCD"
+    lines = [
+        "<|mcq_param_values|>",
+        "Instruction: Choose the correct parameter values for the tool call.",
+        "Options:",
+    ]
+    for i, opt in enumerate(options):
+        lines.append(f"  {letters[i]}) {opt}")
+    lines.append(f"Answer: {letters[correct_idx]}")
+    lines.append("</|mcq_param_values|>")
+    return "\n".join(lines)
+
+
+def _format_arg_values(args: dict) -> str:
+    items = []
+    for k in sorted(args.keys()):
+        try:
+            v = json.dumps(args[k], ensure_ascii=False)
+        except Exception:
+            v = str(args[k])
+        items.append(f"{k}={v}")
+    return "; ".join(items)
+
+
+def _infer_param_type(value: Any) -> str:
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int) and not isinstance(value, bool):
+        return "integer"
+    if isinstance(value, float):
+        return "number"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, dict):
+        return "object"
+    if isinstance(value, str):
+        return "string"
+    return "unknown"
+
+
+def _classify_string(value: str) -> str:
+    lower = value.lower()
+    if lower.startswith(("http://", "https://")):
+        return "string:url"
+    if lower.startswith(("file://", "s3://")) or "/" in value or "\\" in value:
+        return "string:path_or_uri"
+    if len(value.split()) >= 6:
+        return "string:long_text"
+    if value.isdigit():
+        return "string:numeric"
+    if any(ch.isdigit() for ch in value) and any(ch.isalpha() for ch in value):
+        return "string:alnum"
+    return "string:general"
+
+
+def _cluster_label(param_type: str, value: Any) -> str:
+    if param_type in {"integer", "number"}:
+        if isinstance(value, bool):
+            value = int(value)
+        if isinstance(value, int):
+            magnitude = len(str(abs(value))) if value != 0 else 1
+            sign_bucket = "number:negative" if value < 0 else ("number:zero" if value == 0 else "number:positive")
+            if magnitude <= 1:
+                mag_bucket = "single_digit"
+            elif magnitude <= 2:
+                mag_bucket = "two_digits"
+            elif magnitude <= 4:
+                mag_bucket = "four_digits"
+            elif magnitude <= 8:
+                mag_bucket = "eight_digits"
+            else:
+                mag_bucket = "huge"
+            return f"{sign_bucket}:{mag_bucket}"
+        if isinstance(value, float):
+            magnitude = abs(value)
+            if magnitude == 0:
+                return "number:zero"
+            if magnitude < 1:
+                return "number:fraction"
+            if magnitude < 10:
+                return "number:small"
+            if magnitude < 100:
+                return "number:medium"
+            if magnitude < 1000:
+                return "number:large"
+            return "number:huge"
+        return "number:other"
+    if param_type == "boolean":
+        return "boolean"
+    if param_type == "array":
+        return "array"
+    if param_type == "object":
+        return "object"
+    if param_type == "string":
+        return _classify_string(value) if isinstance(value, str) else "string:non_str"
+    return "unknown"
+
+
+def _add_cluster_value(entry: dict, cluster_key: str, value: Any, max_values: int) -> None:
+    clusters = entry.setdefault("clusters", {})
+    bucket = clusters.setdefault(cluster_key, {"count": 0, "values": [], "_seen": set()})
+    bucket["count"] += 1
+    if len(bucket["values"]) >= max_values:
+        return
+    key = json.dumps(value, sort_keys=True, ensure_ascii=False, default=str)
+    if key in bucket["_seen"]:
+        return
+    bucket["_seen"].add(key)
+    bucket["values"].append(value)
+
+
+def _scrub_clusters(entry: dict) -> None:
+    for bucket in (entry.get("clusters") or {}).values():
+        bucket.pop("_seen", None)
+
+
+class ParamPoolBuilder:
+    def __init__(self, max_values: int = 120):
+        self.max_values = max_values
+        self.functions: dict[str, dict] = {}
+        self.params: dict[str, dict] = {}
+        self.types: dict[str, dict] = {}
+
+    def register(self, func_name: str, arguments: dict, schema_props: dict | None = None) -> None:
+        schema_props = schema_props or {}
+        for param_name, value in arguments.items():
+            schema = schema_props.get(param_name) if isinstance(schema_props, dict) else None
+            p_type = _infer_param_type(value)
+            if isinstance(schema, dict) and isinstance(schema.get("type"), str):
+                p_type = schema.get("type") or p_type
+            cluster = _cluster_label(p_type, value)
+
+            func_entry = self.functions.setdefault(func_name, {"params": {}})
+            param_entry = func_entry["params"].setdefault(
+                param_name, {"type": p_type, "required": False, "observed": 0, "clusters": {}}
+            )
+            param_entry["observed"] += 1
+            if p_type and not param_entry.get("type"):
+                param_entry["type"] = p_type
+            _add_cluster_value(param_entry, cluster, value, self.max_values)
+
+            p_entry = self.params.setdefault(param_name, {"type": p_type, "observed": 0, "clusters": {}})
+            p_entry["observed"] += 1
+            if p_type and not p_entry.get("type"):
+                p_entry["type"] = p_type
+            _add_cluster_value(p_entry, cluster, value, self.max_values)
+
+            t_entry = self.types.setdefault(p_type, {"observed": 0, "clusters": {}})
+            t_entry["observed"] += 1
+            _add_cluster_value(t_entry, cluster, value, self.max_values)
+
+    def as_dict(self) -> dict:
+        for func in self.functions.values():
+            for param in func["params"].values():
+                _scrub_clusters(param)
+        for param in self.params.values():
+            _scrub_clusters(param)
+        for entry in self.types.values():
+            _scrub_clusters(entry)
+        return {"functions": self.functions, "params": self.params, "types": self.types}
+
+
+class ParamPool:
+    def __init__(self, data: dict | None):
+        data = data or {}
+        self.functions = data.get("functions") or {}
+        self.params = data.get("params") or {}
+        self.types = data.get("types") or {}
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.functions or self.params or self.types)
+
+    def sample(self, func_name: str, param_name: str, param_type: str | None, original: Any) -> Any | None:
+        func_entry = (self.functions.get(func_name) or {}).get("params", {}).get(param_name)
+        param_entry = self.params.get(param_name)
+        type_entry = self.types.get(param_type) if param_type else None
+        search_order = [func_entry, param_entry, type_entry]
+        for entry in search_order:
+            candidate = self._pick_alternative(entry, original)
+            if candidate is not None:
+                return candidate
+        return None
+
+    @staticmethod
+    def _canonical(value: Any) -> str:
+        try:
+            return json.dumps(value, ensure_ascii=False, sort_keys=True)
+        except Exception:
+            return str(value)
+
+    def _pick_alternative(self, entry: dict | None, original: Any) -> Any | None:
+        if not entry:
+            return None
+        original_key = self._canonical(original)
+        clusters = list((entry.get("clusters") or {}).values())
+        random.shuffle(clusters)
+        for cluster in clusters:
+            values = cluster.get("values") or []
+            if not values:
+                continue
+            pool = list(values)
+            random.shuffle(pool)
+            for value in pool:
+                if self._canonical(value) != original_key:
+                    return value
+        return None
+
+
+def load_param_pool(path: str | None) -> ParamPool:
+    if not path:
+        return ParamPool(None)
+    p = Path(path)
+    if not p.exists():
+        return ParamPool(None)
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return ParamPool(data if isinstance(data, dict) else None)
+    except Exception:
+        return ParamPool(None)
+
+
+def build_param_pool_from_prepare(input_dir: Path, output_path: Path, *, max_values: int = 120) -> None:
+    builder = ParamPoolBuilder(max_values=max_values)
+    input_dir = Path(input_dir)
+    output_path = Path(output_path)
+    for src in sorted(input_dir.glob("*.jsonl")):
+        with src.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                text = obj.get("text", "") or ""
+                tools = _extract_tools_from_text(text)
+                schema_map: dict[str, dict] = {}
+                for t in tools:
+                    name = _tool_name(t)
+                    if not name:
+                        continue
+                    _, props = _tool_param_schema(t)
+                    schema_map[name] = props
+                scan_pos = 0
+                while True:
+                    start = text.find(TOOL_CALL_START, scan_pos)
+                    if start == -1:
+                        break
+                    end = text.find(TOOL_CALL_END, start)
+                    if end == -1:
+                        break
+                    payload = text[start + len(TOOL_CALL_START) : end]
+                    call = _parse_tool_call_payload(payload)
+                    if call:
+                        name = call.get("name") if isinstance(call.get("name"), str) else ""
+                        args = _parse_tool_call_arguments(call)
+                        if name and isinstance(args, dict) and args:
+                            builder.register(name, args, schema_map.get(name))
+                    scan_pos = end + len(TOOL_CALL_END)
+    if output_path.is_dir() or output_path.suffix.lower() != ".json":
+        output_path = output_path / "param_pool.json"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(builder.as_dict(), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def augment_tool_mcq_record(
+    text: str,
+    *,
+    seed: int = 0,
+    max_mcq: int = 1,
+    param_pool: ParamPool | None = None,
+    max_param_values_neg: int = 3,
+) -> str:
     tools = _extract_tools_from_text(text)
     tool_names = [n for n in (_tool_name(t) for t in tools) if n]
+    tool_schema_map: dict[str, tuple[list[str], dict]] = {}
+    for t in tools:
+        name = _tool_name(t)
+        if not name:
+            continue
+        tool_schema_map[name] = _tool_param_schema(t)
 
     rng = random.Random(seed)
     out = []
     pos = 0
     mcq_count = 0
-    # fallback: gather tool names from existing tool_call payloads in this record
-    if not tool_names:
-        tmp_names = set()
-        scan_pos = 0
-        while True:
-            start = text.find(TOOL_CALL_START, scan_pos)
-            if start == -1:
-                break
-            end = text.find(TOOL_CALL_END, start)
-            if end == -1:
-                break
-            payload = text[start + len(TOOL_CALL_START) : end]
-            call = _parse_tool_call_payload(payload)
-            if call and isinstance(call.get("name"), str):
-                tmp_names.add(call["name"])
-            scan_pos = end + len(TOOL_CALL_END)
-        tool_names = sorted(tmp_names)
     while True:
         start = text.find(TOOL_CALL_START, pos)
         if start == -1:
@@ -151,6 +444,7 @@ def augment_tool_mcq_record(text: str, *, seed: int = 0, max_mcq: int = 3) -> st
         out.append(text[pos:start])
         if call and mcq_count < max_mcq:
             name = call.get("name") if isinstance(call.get("name"), str) else ""
+            inserted = False
             if name and name in tool_names and len(tool_names) >= 2:
                 distractors = [n for n in tool_names if n != name]
                 rng.shuffle(distractors)
@@ -158,25 +452,86 @@ def augment_tool_mcq_record(text: str, *, seed: int = 0, max_mcq: int = 3) -> st
                 rng.shuffle(options)
                 correct_idx = options.index(name)
                 out.append(_render_mcq_tool(name, options, correct_idx))
+                inserted = True
 
-                # params MCQ
-                tool = next((t for t in tools if _tool_name(t) == name), None)
-                if tool:
-                    req = _tool_required_params(tool)
-                    if req:
-                        wrong1 = ", ".join(req[:-1]) if len(req) > 1 else "(none)"
-                        wrong2 = ", ".join(req + ["extra"]) if req else "extra"
-                        wrong3 = "(none)"
-                        opts = [", ".join(req), wrong1, wrong2, wrong3]
-                        rng.shuffle(opts)
-                        out.append(_render_mcq_params(req, opts, opts.index(", ".join(req))))
+            # params MCQ (schema-based)
+            tool = next((t for t in tools if _tool_name(t) == name), None)
+            if tool:
+                req = _tool_required_params(tool)
+                if req:
+                    wrong1 = ", ".join(req[:-1]) if len(req) > 1 else "(none)"
+                    wrong2 = ", ".join(req + ["extra"]) if req else "extra"
+                    wrong3 = "(none)"
+                    opts = [", ".join(req), wrong1, wrong2, wrong3]
+                    rng.shuffle(opts)
+                    out.append(_render_mcq_params(req, opts, opts.index(", ".join(req))))
+                    inserted = True
+            # param_values MCQ (requires param_pool)
+            args = _parse_tool_call_arguments(call)
+            if args and param_pool and param_pool.enabled and max_param_values_neg > 0:
+                req, props = tool_schema_map.get(name, ([], {}))
+                correct = _format_arg_values(args)
+                variations: set[str] = set()
+                attempts = 0
+                max_attempts = max_param_values_neg * 8
+                required_fields = [p for p in req if p in args]
+                fields = list(args.keys())
+                while len(variations) < max_param_values_neg and attempts < max_attempts:
+                    attempts += 1
+                    strategy = rng.choice(["pool", "pool", "drop_required", "drop_any"])
+                    mutated = None
+                    if strategy == "pool":
+                        mutated = dict(args)
+                        k = rng.randint(1, min(2, len(fields)))
+                        for field in rng.sample(fields, k):
+                            schema = props.get(field) if isinstance(props, dict) else None
+                            p_type = (
+                                schema.get("type")
+                                if isinstance(schema, dict) and isinstance(schema.get("type"), str)
+                                else _infer_param_type(args[field])
+                            )
+                            repl = param_pool.sample(name, field, p_type, args[field])
+                            if repl is not None:
+                                mutated[field] = repl
+                        if mutated == args:
+                            mutated = None
+                    elif strategy == "drop_required" and required_fields:
+                        mutated = dict(args)
+                        drop = rng.choice(required_fields)
+                        mutated.pop(drop, None)
+                    elif strategy == "drop_any":
+                        mutated = dict(args)
+                        drop = rng.choice(fields)
+                        mutated.pop(drop, None)
+                    if not mutated:
+                        continue
+                    option = _format_arg_values(mutated)
+                    if option and option != correct:
+                        variations.add(option)
+                if variations:
+                    options = list(variations)
+                    if len(options) > max_param_values_neg:
+                        options = rng.sample(options, max_param_values_neg)
+                    options.append(correct)
+                    rng.shuffle(options)
+                    out.append(_render_mcq_param_values(options, options.index(correct)))
+                    inserted = True
+            if inserted:
                 mcq_count += 1
         out.append(text[start : end + len(TOOL_CALL_END)])
         pos = end + len(TOOL_CALL_END)
     return "".join(out)
 
 
-def run_postprocess_tool_mcq(input_dir: Path, output_dir: Path, *, max_mcq: int = 3) -> None:
+def run_postprocess_tool_mcq(
+    input_dir: Path,
+    output_dir: Path,
+    *,
+    max_mcq: int = 1,
+    param_pool_path: str | None = None,
+    max_param_values_neg: int = 3,
+) -> None:
+    param_pool = load_param_pool(param_pool_path)
     output_dir.mkdir(parents=True, exist_ok=True)
     for src in sorted(input_dir.glob("*.jsonl")):
         dst = output_dir / src.name
@@ -193,12 +548,19 @@ def run_postprocess_tool_mcq(input_dir: Path, output_dir: Path, *, max_mcq: int 
                     continue
                 text = obj.get("text", "") or ""
                 seed = hash(obj.get("uuid") or obj.get("id") or idx) & 0xFFFFFFFF
-                obj["text"] = augment_tool_mcq_record(text, seed=seed, max_mcq=max_mcq)
+                obj["text"] = augment_tool_mcq_record(
+                    text,
+                    seed=seed,
+                    max_mcq=max_mcq,
+                    param_pool=param_pool,
+                    max_param_values_neg=max_param_values_neg,
+                )
                 w.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
 
 POSTPROCESS_REGISTRY: dict[str, Callable[..., None]] = {
     "tool_mcq": run_postprocess_tool_mcq,
+    "param_pool": build_param_pool_from_prepare,
 }
 
 
@@ -262,8 +624,29 @@ def run_postprocess(kind: str, input_dir: Path, output_dir: Path, *, config: dic
         return
 
     def _run(in_dir: Path, out_dir: Path) -> None:
+        print(f"[post] run_postprocess: kind={kind} in_dir={in_dir} out_dir={out_dir}", flush=True)
         if kind == "tool_mcq":
-            fn(in_dir, out_dir, max_mcq=int(config.get("max_mcq", 1)))
+            pool_path = str(config.get("param_pool_path") or "").strip()
+            if not pool_path:
+                # Auto-detect when chained with param_pool in same output dir.
+                candidate = (out_dir / "param_pool.json")
+                if candidate.exists():
+                    pool_path = candidate.as_posix()
+                else:
+                    candidate = (in_dir / "param_pool.json")
+                    if candidate.exists():
+                        pool_path = candidate.as_posix()
+            fn(
+                in_dir,
+                out_dir,
+                max_mcq=int(config.get("max_mcq", 1)),
+                param_pool_path=pool_path,
+                max_param_values_neg=int(config.get("max_param_values_neg", 3)),
+            )
+            return
+        if kind == "param_pool":
+            max_values = int(config.get("max_values", 120))
+            fn(in_dir, out_dir, max_values=max_values)
             return
         fn(in_dir, out_dir)
 

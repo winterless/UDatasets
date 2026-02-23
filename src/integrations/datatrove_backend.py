@@ -2251,6 +2251,10 @@ def run_pipeline(
                     prepare_dir = Path(out_root) / "prepare" / name
                     if prepare_dir.exists():
                         out_dir = Path(out_root) / out_subdir / name
+                        print(
+                            f"[post] {name}: start kinds={kinds} prepare_dir={prepare_dir} out_dir={out_dir}",
+                            file=sys.stderr,
+                        )
                         cur_in = prepare_dir
                         for i, k in enumerate(kinds):
                             if isinstance(k, dict):
@@ -2261,7 +2265,16 @@ def run_pipeline(
                                 cfg_item = post_cfg if isinstance(post_cfg, dict) else {}
                             if not kind:
                                 continue
-                            run_postprocess(kind, cur_in if i == 0 else out_dir, out_dir, config=cfg_item)
+                            # param_pool is a side-effect step; keep input as prepare_dir
+                            if kind == "param_pool":
+                                print(
+                                    f"[post] {name}: running kind={kind} input={prepare_dir} output={out_dir}",
+                                    file=sys.stderr,
+                                )
+                                run_postprocess(kind, prepare_dir, out_dir, config=cfg_item)
+                                continue
+                            print(f"[post] {name}: running kind={kind} input={cur_in} output={out_dir}", file=sys.stderr)
+                            run_postprocess(kind, cur_in, out_dir, config=cfg_item)
                             cur_in = out_dir
                         print(f"[post] {name}: postprocess={','.join(str(x) for x in kinds)} -> {out_dir}", file=sys.stderr)
                         if isinstance(post_cfg, dict) and post_cfg.get("pretty_txt"):
